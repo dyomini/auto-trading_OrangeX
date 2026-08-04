@@ -9,22 +9,96 @@ MANUAL_MODE를 고치지 않고도, 실행할 때마다 물어봐서 그 값을 
 2026-08-05: "즉시 진입"(숏!/롱!) 메뉴 추가 — `quick_entry.py`를 감싸서, 현재가부터
 지정가 주문 여러 개를 한 번에 걸어놓는 수동 진입을 봇 자동매매와 별개로 실행할 수
 있게 한다.
+
+2026-08-05: 메뉴 선택을 번호 입력 대신 방향키(↑/↓) + Enter로 고를 수 있게 함(사용자
+요청). 실제 콘솔에 붙어 있을 때만(`sys.stdin.isatty()`) 방향키 모드로 동작하고,
+파이프로 입력을 리다이렉트한 경우(자동화/테스트)는 기존 번호 입력 방식으로 자동
+폴백한다 — 개발자가 `python main.py`를 직접 쓰거나 테스트에서 stdin을 주입하는
+경로를 그대로 유지하기 위함.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
+import sys
 from decimal import Decimal, InvalidOperation
 
+try:
+    import msvcrt
+except ImportError:  # Windows 전용 — 이 프로젝트는 run.bat/launcher.py로 Windows에서만
+    msvcrt = None    # 배포되므로(README 참고) 다른 OS에서는 번호 입력으로만 동작한다.
 
-def _ask_choice(prompt: str, options: dict[str, str], default: str) -> str:
+
+def _enable_vt_mode() -> None:
+    """Windows 콘솔에서 커서 이동 ANSI 이스케이프(화살표 메뉴 다시 그리기용)가
+    먹히도록 VT100 처리를 켠다. 최신 Windows는 대부분 기본으로 켜져 있지만, 혹시
+    꺼져 있어도 메뉴가 아예 못 쓰게 되진 않도록(최악의 경우 이스케이프 문자가 그대로
+    보일 뿐) 실패해도 조용히 넘어간다."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        kernel32.GetConsoleMode(handle, ctypes.byref(mode))
+        kernel32.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    except Exception:
+        pass
+
+
+def _ask_choice_by_number(prompt: str, options: dict[str, str], default: str) -> str:
+    """기존 번호 입력 방식 — 실제 콘솔이 아닐 때(파이프/테스트)의 폴백."""
     print(prompt)
     for key, label in options.items():
         marker = " (기본값)" if key == default else ""
         print(f"  {key}. {label}{marker}")
     choice = input("번호를 입력하고 Enter를 누르세요: ").strip()
     return choice if choice in options else default
+
+
+def _ask_choice_by_arrows(prompt: str, options: dict[str, str], default: str) -> str:
+    """방향키(↑/↓)로 항목을 옮기고 Enter로 확정한다."""
+    keys = list(options.keys())
+    selected = keys.index(default) if default in keys else 0
+
+    _enable_vt_mode()
+    print(prompt)
+    print("(방향키 ↑/↓로 이동, Enter로 선택)")
+    for _ in keys:
+        print()  # 아래에서 덮어쓸 자리를 미리 확보
+
+    def render() -> None:
+        sys.stdout.write(f"\x1b[{len(keys)}A")
+        for i, key in enumerate(keys):
+            marker = "> " if i == selected else "  "
+            default_tag = " (기본값)" if key == default else ""
+            sys.stdout.write("\x1b[K" + f"{marker}{key}. {options[key]}{default_tag}\n")
+        sys.stdout.flush()
+
+    render()
+    while True:
+        ch = msvcrt.getch()
+        if ch in (b"\xe0", b"\x00"):  # 화살표 등 기능키의 첫 바이트
+            ch2 = msvcrt.getch()
+            if ch2 == b"H":  # Up
+                selected = (selected - 1) % len(keys)
+                render()
+            elif ch2 == b"P":  # Down
+                selected = (selected + 1) % len(keys)
+                render()
+        elif ch in (b"\r", b"\n"):
+            print()
+            return keys[selected]
+        elif ch == b"\x03":  # Ctrl+C
+            raise KeyboardInterrupt
+
+
+def _ask_choice(prompt: str, options: dict[str, str], default: str) -> str:
+    if msvcrt is not None and sys.stdin.isatty():
+        return _ask_choice_by_arrows(prompt, options, default)
+    return _ask_choice_by_number(prompt, options, default)
 
 
 def _configure_mode() -> str:
