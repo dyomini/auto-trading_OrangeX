@@ -1,0 +1,186 @@
+"""engine/cycle_manager.py 유닛 테스트.
+
+CycleManager가 새 사이클을 위해 계산하는 grid_rows는 engine/grid_setup.py의
+build_grid_rows()를 그대로 거치므로(실제 100단계 격자, tests/test_grid_setup.py가
+그 자체는 검증함) 여기서는 "COOLDOWN을 감지해서 기다렸다가 reset_for_new_cycle을
+실제로 호출하는지"라는 CycleManager 고유의 오케스트레이션만 검증한다.
+"""
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timezone
+from decimal import Decimal
+
+import httpx
+import pytest
+
+from config.settings import Settings
+from engine.cycle_manager import CycleManager
+from engine.grid_engine import EngineState, GridEngine
+from exchange.base import ContractSpec
+from exchange.orangex.adapter import OrangeXAdapter
+from exchange.paper import PaperAdapter
+from strategy.grid import GridStepResult
+
+INSTRUMENT = "BTC-USDT-PERPETUAL"
+ONE_DAY_MS = 24 * 60 * 60 * 1000
+
+
+def make_flat_binance_client() -> httpx.AsyncClient:
+    """가격 변화가 전혀 없는(true range=0 -> ATR=0) 완결 일봉 응답을 흉내내서
+    ATR 급등 배율이 항상 1(확대 없음)이 되도록 한다 — 이 파일의 테스트들은 tick 값
+    자체가 아니라 COOLDOWN 감지/리셋 오케스트레이션만 검증하므로, ATR 확대가 끼어들어
+    entry_price 등 결과를 예측 불가능하게 만들지 않도록 고정해둔다."""
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    n = 18
+    rows = []
+    for i in range(n):
+        offset = n - 1 - i
+        open_time_ms = now_ms - 3_600_000 - offset * ONE_DAY_MS
+        rows.append([open_time_ms, "64000", "64000", "64000", "64000"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=rows)
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+class FakeOrangeXClient:
+    def __init__(self, responses: dict[str, object]) -> None:
+        self.responses = responses
+
+    async def call(self, method, params=None, authed=True):
+        response = self.responses[method]
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+def make_market_data_adapter(last_price: str = "64000") -> OrangeXAdapter:
+    client = FakeOrangeXClient(
+        {
+            "/public/get_instruments": {
+                "instruments": [
+                    {
+                        "instrument_name": INSTRUMENT,
+                        "tick_size": "50",
+                        "min_qty": "0.001",
+                        "min_notional": "10",
+                        "contract_size": "1",
+                    }
+                ]
+            },
+            "/public/ticker": {"last_price": last_price},
+        }
+    )
+    return OrangeXAdapter(client)
+
+
+def make_row(index: int, major_tier: int, entry_price: Decimal, avg_price: Decimal, tp: Decimal, sl: Decimal) -> GridStepResult:
+    return GridStepResult(
+        index=index, major_tier=major_tier, sub_step=1, entry_price=entry_price, weight=Decimal("1"),
+        step_qty=Decimal("0.01"), step_margin=Decimal("100"), cum_qty=Decimal("0.01") * (index + 1),
+        cum_margin=Decimal("100") * (index + 1), avg_price=avg_price, available_balance=Decimal("1000"),
+        liq_price=Decimal("50000"), target_roe=Decimal("0.1"), target_tp_price=tp, sl_price=sl,
+    )
+
+
+def make_grid_rows() -> list[GridStepResult]:
+    return [make_row(0, 1, Decimal("64000"), Decimal("64000"), Decimal("64640"), Decimal("62080"))]
+
+
+def make_paper_adapter() -> PaperAdapter:
+    spec = ContractSpec(instrument=INSTRUMENT, tick_size=Decimal("50"), min_qty=Decimal("0.0001"), min_notional=Decimal("10"), contract_size=Decimal("1"))
+    return PaperAdapter(instrument=INSTRUMENT, contract_spec=spec, initial_equity=Decimal("10000"), leverage=Decimal("20"), maker_fee=Decimal("0.0002"), taker_fee=Decimal("0.0006"))
+
+
+def make_settings(**overrides) -> Settings:
+    defaults = dict(
+        symbol=INSTRUMENT, direction="long", equity_usdt=Decimal("10000"), leverage=Decimal("20"),
+        grid_tick=Decimal("50"), cooldown_minutes=0,
+    )
+    defaults.update(overrides)
+    return Settings(**defaults)
+
+
+async def drive_engine_to_cooldown(engine: GridEngine, adapter: PaperAdapter, rows: list[GridStepResult]) -> None:
+    """5-row 픽스처가 아니라 1-row로 충분 — tier1이라 SL 없이 바로 TP_PENDING까지 간다."""
+    await engine.start_laddering()
+    order_id = engine.resting_grid_order_ids[0]
+    await adapter.fill_order(order_id, qty=rows[0].step_qty, price=rows[0].entry_price)
+    await adapter.on_price_tick(rows[0].entry_price)
+    await engine.on_fill(0)
+    assert engine.state == EngineState.TP_PENDING
+
+    await adapter.fill_order(engine.tp_order_id, qty=engine.open_qty, price=rows[0].target_tp_price)
+    await engine.on_tp_filled()
+    assert engine.state == EngineState.COOLDOWN
+
+
+@pytest.mark.asyncio
+async def test_start_next_cycle_resets_engine_with_freshly_computed_rows():
+    adapter = make_paper_adapter()
+    old_rows = make_grid_rows()
+    engine = GridEngine(adapter=adapter, instrument=INSTRUMENT, direction="long", grid_rows=old_rows, max_open_grid_orders=1)
+    await drive_engine_to_cooldown(engine, adapter, old_rows)
+
+    market_data_adapter = make_market_data_adapter(last_price="65000")
+    contract_spec = await market_data_adapter.get_contract_spec(INSTRUMENT)
+    settings = make_settings()
+    binance_client = make_flat_binance_client()
+    manager = CycleManager(
+        engine=engine, market_data_adapter=market_data_adapter, contract_spec=contract_spec,
+        settings=settings, binance_http_client=binance_client,
+    )
+
+    await manager.start_next_cycle()
+    await binance_client.aclose()
+
+    assert engine.state == EngineState.IDLE
+    assert engine.grid_rows is not old_rows
+    assert engine.grid_rows[0].entry_price == Decimal("65000")  # 새 현재가 기준 base_price
+    assert len(engine.grid_rows) > 1  # 실제 100단계(또는 절삭된) 격자로 교체됨
+    assert engine.filled_step_count == 0
+    assert engine.open_qty == Decimal("0")
+
+
+@pytest.mark.asyncio
+async def test_run_detects_cooldown_and_starts_next_cycle_automatically():
+    adapter = make_paper_adapter()
+    old_rows = make_grid_rows()
+    engine = GridEngine(adapter=adapter, instrument=INSTRUMENT, direction="long", grid_rows=old_rows, max_open_grid_orders=1)
+    await engine.start_laddering()  # 아직 COOLDOWN 전 — CycleManager가 대기 상태를 유지해야 함
+
+    market_data_adapter = make_market_data_adapter()
+    contract_spec = await market_data_adapter.get_contract_spec(INSTRUMENT)
+    settings = make_settings(cooldown_minutes=0)
+    binance_client = make_flat_binance_client()
+    manager = CycleManager(
+        engine=engine, market_data_adapter=market_data_adapter, contract_spec=contract_spec,
+        settings=settings, poll_interval_seconds=0, binance_http_client=binance_client,
+    )
+
+    task = asyncio.create_task(manager.run())
+    try:
+        await asyncio.sleep(0)
+        assert engine.state == EngineState.LADDERING  # 아직 대기 중 — 잘못 리셋되지 않았음
+
+        order_id = engine.resting_grid_order_ids[0]
+        await adapter.fill_order(order_id, qty=old_rows[0].step_qty, price=old_rows[0].entry_price)
+        await adapter.on_price_tick(old_rows[0].entry_price)
+        await engine.on_fill(0)
+        await adapter.fill_order(engine.tp_order_id, qty=engine.open_qty, price=old_rows[0].target_tp_price)
+        await engine.on_tp_filled()
+        assert engine.state == EngineState.COOLDOWN
+
+        for _ in range(500):
+            if engine.state == EngineState.IDLE:
+                break
+            await asyncio.sleep(0)
+        assert engine.state == EngineState.IDLE
+        assert engine.grid_rows is not old_rows
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await binance_client.aclose()

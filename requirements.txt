@@ -1,0 +1,6 @@
+httpx>=0.28
+pydantic>=2.13
+pydantic-settings>=2.14
+pytest>=9.1
+pytest-asyncio>=1.4
+websockets>=17.0

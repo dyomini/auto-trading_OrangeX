@@ -1,0 +1,140 @@
+# Phase 3 계획 — 실행 엔진 (SL/TP 라이브 검증 반영)
+
+이 문서는 SPEC.md Phase 3(라인 86-100)의 실행 계획을 담는다. SPEC.md 원문 자체는 사용자 요청으로 아직 수정하지 않았다 — 결정 사항은 여기 기록하고, SPEC.md와 다른 부분은 이 문서가 우선한다.
+
+## 배경
+
+SPEC.md Phase 3는 원래 "체결마다 TP 취소 후 재등록"과 "4~5차 진입 시 거래소 SL 필수 등록(실패 시 강제청산)"을 요구했다. Phase 0/2 시점에는 SL을 거래소에 실제로 등록하는 방법이 불확실해(`docs/api-notes.md` §5) 사용자가 스코프에서 제외했었다.
+
+**2026-07-30, Phase 3 설계 중 재검증**: `condition_type=STOP` 조건부 주문이 실제로 거래소에 등록되는 진짜 SL임을 라이브로 확인했다 (`docs/api-notes.md` §6 항목18, `scripts/orangex_test_stop_order.py`/`orangex_test_stop_order_cancel.py`). 트리거 시 실제 시장가 체결이 일어나고(포지션 수량 실제 감소로 교차검증), 트리거 전 주문은 기존 `cancel_order`로 정상 취소된다. 따라서 **SPEC 원래 설계를 그대로 구현한다** (아래 "Branch A" 확정).
+
+핵심 발견: OrangeX의 STOP 트리거는 **crossing-trigger**다 — 주문 시점에 조건이 이미 참이어도 발동하지 않고, 이후 실제 가격이 trigger_price를 가로질러야 발동한다. 구현 시 trigger_price는 항상 "주문 시점 가격 기준 아직 미도달 방향"으로 설정해야 한다.
+
+## TP/SL 최종 설계
+
+- **TP**: 별도 API 불필요. `place_limit_order`로 목표가에 반대방향 지정가 주문(이미 라이브 검증됨). 체결마다 평단이 바뀌면 기존 TP 주문을 `cancel_order`로 취소 후 새 평단 기준으로 재등록.
+- **SL (4~5차 진입 전용, SPEC 그대로)**: `condition_type=STOP` 조건부 주문으로 평단∓3%에 등록. 평단 갱신 시 취소(`cancel_order`, 이미 STOP 주문에도 동작 확인됨) → 재등록(취소-확인-등록 순서 엄수). **등록 실패 시 SPEC 원문대로 즉시 전량 시장가 청산 + 봇 정지.**
+- 3차+ 진입 후 평단 도달 시 50% 시장가 청산(hybrid reset)은 SPEC 그대로 유지.
+
+## `ExchangeAdapter` 인터페이스 변경 (`exchange/base.py`)
+
+- `place_stop_order(order: StopOrderRequest) -> OrderResult` 추가 (기존에 "의도적으로 제외"됐던 `place_stop_order`를 복원 — 근거였던 docstring 갱신 필요)
+- `StopOrderRequest` 데이터클래스 추가: `instrument, side, trigger_price, qty, client_order_id, reduce_only, trigger_price_type="last"` 등 (`condition_type`은 OrangeX 구현 세부사항이라 어댑터 내부에서만 사용, 인터페이스는 거래소 중립적으로 유지)
+- `OrangeXAdapter.place_stop_order`: `condition_type=STOP`, `trigger_price_type=2`(last price)로 라이브 검증된 파라미터 그대로 구현
+- `PaperAdapter.place_stop_order`: 시뮬레이션 구현 — `on_price_tick`에서 STOP 주문의 trigger_price를 가로지르면 시장가 체결로 처리 (crossing-trigger 동작을 그대로 재현: 등록 시점에 이미 조건이 충족돼 있어도 트리거하지 않고, 이후 가격이 실제로 가로지를 때만 체결)
+
+## 실행 엔진 골격 (신규 `engine/` 디렉터리)
+
+- **상태 머신**: `IDLE → SCOUTING → LADDERING → TP_PENDING → CLOSING → COOLDOWN`
+- **진입 필터**: 일봉 RSI(14) ≤30(롱)/≥70(숏), ATR 급등 시 격자 간격 확대. `pandas-ta` 의존성 추가 필요(미설치). **선결 조사**: OHLC/캔들 공개 엔드포인트 존재 여부 미확인 — 지금까지 `ticker`/`order_book`/`last_trades`만 확인됨, 캔들 엔드포인트는 조사된 바 없음
+- **롤링 격자 주문**: 100단계 전부가 아니라 현재가 기준 앞쪽 N개(기본 5, `config/settings.py`에 `max_open_grid_orders` 추가)만 유지
+- **체결마다**: `strategy/grid.py`의 `compute_grid` 재사용해 평단/청산가/TP/SL 재계산 → TP 지정가 재등록 + (4~5차라면) SL STOP 주문 재등록
+- **재시작 복구**: 거래소의 실제 포지션/미체결 주문으로 로컬 상태 재구성. **라이브 블로커**: `get_open_orders()`가 OrangeX에서 "No service found" — 해소 전까지 라이브 재시작 복구 불가. `PaperAdapter`로 먼저 개발/테스트, OrangeX 전환은 이 이슈 해소 후
+- **가격 밴드 제약**: `order_price_low_rate`/`high_rate`(0.5~1.5배) 반영 필요
+
+## `config/settings.py` 추가 필드
+
+- `max_open_grid_orders: int = 5`
+- RSI/ATR 파라미터
+- `maker_fee`/`taker_fee` (실측 0.02%/0.06%)
+- SL 관련: `sl_pct`(기존 `strategy/targets.py`에 있음), STOP 주문 trigger_price_type 기본값
+
+## 테스트 전략
+
+- 신규 엔진 로직은 `PaperAdapter` + 결정론적 가격 틱 시뮬레이션으로 유닛/골든 테스트
+- `condition_type=STOP` 관련 `OrangeXAdapter` 코드는 `test_orangex_adapter.py` 패턴으로 Mock 기반 테스트 추가 (crossing-trigger 특성 포함)
+- 라이브 주문이 관여하는 모든 테스트는 사전에 사용자에게 명시적으로 알리고 진행 (SPEC 0번 원칙)
+
+## 구현 현황 (2026-07-30)
+
+- **완료**: `exchange/base.py`에 `StopOrderRequest`/`place_stop_order`, `MarketOrderRequest`/`place_market_order` 추가. `OrangeXAdapter`/`PaperAdapter` 둘 다 구현.
+  - `PaperAdapter.place_stop_order`는 crossing-trigger 특성(등록 시점에 조건이 이미 참이어도 발동 안 함)을 그대로 재현한다.
+  - `PaperAdapter.place_market_order`는 `_last_price`(마지막 `on_price_tick` 호출값) 기준 즉시체결로 시뮬레이션한다. `_last_price`가 없으면 `NoKnownPriceError`.
+  - `OrangeXAdapter.place_market_order`는 문서상 `type="market"` 파라미터 기반으로 구현했으나 **2026-07-30 기준 라이브 미검증** — place_stop_order/place_limit_order와 달리 실제 체결 여부 확인 안 됨. SPEC 3번 규칙에 따라 사용자가 명시적으로 요청하기 전까지 라이브 호출 금지.
+- **완료**: `strategy/indicators.py`(RSI/ATR, Wilder 평활화, Decimal 전용 — pandas-ta 대신 직접 구현해 float 미사용 원칙 유지), `strategy/market_data.py`(바이낸스 공개 API로 일봉 캔들 조달 — OrangeX에 캔들 엔드포인트가 없어(9개 후보 전부 "No service found", `scripts/orangex_probe_candles.py`) 사용자 승인(2026-07-30)으로 외부 API를 캔들 전용 보조 소스로 채택. 실제 주문/체결은 전부 OrangeX).
+- **완료**: `engine/grid_engine.py` — `GridEngine` 클래스로 상태 머신/롤링 격자 주문/체결 시 TP·SL(4~5차) 재등록/hybrid reset(3차+)/SL 등록 실패 시 강제청산+정지(`EngineHaltedError`)까지 구현. `strategy.grid.compute_grid()`가 이미 누적 계산해둔 값을 인덱스로 조회하는 방식이라 별도 재계산 로직 없음. `open_qty` 필드로 hybrid reset 이후에도 실제 보유 수량을 정확히 추적(가격 필드는 grid_rows 그대로, 수량만 별도 추적).
+- **완료**: `engine/entry_filter.py` — RSI(14) ≤30(롱)/≥70(숏) 게이트만 구현. ATR 급등 시 "격자 간격 확대"는 SPEC에 구체적 배율/공식이 없어 미구현(추측 금지 원칙).
+- 테스트: `tests/test_indicators.py`, `tests/test_market_data.py`(httpx.MockTransport), `tests/test_grid_engine.py`(PaperAdapter로 실제 체결시키며 검증) — 전체 스위트 67개 통과.
+- **완료(2026-07-30)**: `engine/fill_router.py` — `FillRouter`가 `watch_fills()` 스트림을 `GridEngine` 이벤트로 라우팅한다. `Fill.order_id`를 엔진이 들고 있는 order_id(`resting_grid_order_ids`/`tp_order_id`/`sl_order_id`)와 직접 비교해 매칭한다(client_order_id 문자열 prefix 파싱에 의존하지 않음). 매칭 안 되는 Fill(hybrid reset/강제청산 시장가 체결처럼 엔진이 이미 동기적으로 처리한 것)은 무시한다.
+  - `GridEngine`에 `on_sl_filled()` 추가(`on_tp_filled()`와 대칭 — SL 트리거로 전량 청산되면 잔여 격자 주문·TP 주문 취소 후 COOLDOWN 전이).
+  - 구현 중 발견한 버그: `PaperAdapter.on_price_tick`/`fill_order`(지정가·STOP 체결)가 `_fill_queue`에 전혀 쌓이지 않아 `watch_fills()`가 시장가 주문 체결만 관측하고 있었다. `_apply_fill`에서 공통으로 큐잉하도록 수정(`exchange/paper.py`) — 이 수정 전에는 `FillRouter`가 실제로는 아무것도 라우팅하지 못했을 것.
+  - 테스트: `tests/test_fill_router.py` — route() 단위 테스트(격자 진입/TP/SL 매칭, 미매칭 무시) + `run()`을 백그라운드 태스크로 돌려 `PaperAdapter.watch_fills()`를 실제로 소비하는 end-to-end 테스트 2개(TP 경로, SL crossing-trigger 경로). 전체 스위트 73개 통과.
+  - `OrangeXAdapter.watch_fills`는 여전히 `NotImplementedError` — 라이브 전환 전 별도 구현 필요(웹소켓 여부 등 미조사).
+- **완료(2026-07-30)**: `engine/entry_scheduler.py` — `EntryScheduler`가 RSI 일봉 확인을 "언제" 수행할지의 실제 루프를 담당한다. `IDLE`이면 `GridEngine.start_scouting()`(신규 추가한 IDLE→SCOUTING 전이 메서드)을 먼저 호출하고, `SCOUTING`인 동안 `poll_interval_seconds`(기본 3600, `config/settings.py`의 `rsi_poll_interval_seconds` — SPEC에 구체적 주기가 없어 임의 기본값)마다 바이낸스 일봉을 가져와 RSI(14)를 계산, `passes_rsi_filter` 통과 시 `start_laddering()`을 호출한다.
+  - `_closed_candles()`가 아직 마감 안 된(진행 중인) 당일 봉을 제외한다 — 바이낸스 klines가 마지막 행으로 진행 중 봉을 같이 주기 때문에, 안 걸러내면 하루 중 신호가 계속 뒤집힐 수 있음.
+  - 테스트: `tests/test_entry_scheduler.py` — `_closed_candles` 단위 테스트 2개, `check_once()` 단위 테스트 3개(단조 증가/감소 종가로 RSI 극단값 0/100을 결정론적으로 유도), `run()`을 백그라운드 태스크로 돌려 IDLE→SCOUTING→LADDERING 전이를 실제로 검증하는 end-to-end 테스트 1개. 전체 스위트 79개 통과.
+  - ATR 급등 시 격자 간격 확대는 여전히 미구현 — SPEC에 배율/공식이 없어 `engine/entry_filter.py`와 동일한 이유로 보류.
+- **완료(2026-07-30)**: `engine/restart_recovery.py` — `reconstruct_state()`/`build_recovered_engine()`이 거래소의 `get_position()`/`get_open_orders()`만으로 `GridEngine` 상태를 재구성한다. 재시작 직후엔 엔진 메모리가 없어 `FillRouter`처럼 order_id로 매칭할 수 없으므로, `GridEngine`이 실제로 붙이는 client_order_id prefix 규칙("grid-{index}-...", "tp-{index}-...", "sl-{index}-...")에 의존한다. 조금이라도 앞뒤가 안 맞으면(TP 없는데 포지션 있음, tier4+인데 SL 없음, 미체결 격자 인덱스가 불연속, 포지션 수량이 이론치/hybrid reset 수량 어느 쪽과도 안 맞음 등) `RestartRecoveryError`로 막고 절대 추측하지 않는다(SPEC 100줄 원칙).
+  - **알려진 한계(이 모듈 단독으로는 여전히 유효, 시스템 전체로는 해소됨)**: `GridEngine.halted`(SL 등록 실패로 강제청산+정지)는 거래소 상태만으로 구분 불가 — 정상 COOLDOWN과 강제청산 후 상태가 둘 다 "포지션 flat, 주문 없음"으로 동일하게 보여서 이 모듈은 그런 경우 전부 `IDLE`(재스카우팅 허용)로 복구한다. **2026-07-30 갱신**: `engine/halt_flag.py`가 `main.py`에서 이 모듈보다 먼저 실행돼 halted 흔적이 있으면 애초에 이 모듈까지 도달하지 못하게 막으므로, 실제 운용에서는 더 이상 문제가 안 된다.
+  - **2026-07-30 갱신**: `get_open_orders()` 라이브 블로커 해소됨(아래 참고) — PaperAdapter 기준 테스트는 여전히 유효하고, OrangeX 라이브로 이 모듈 자체를 끝까지 기동해본 적은 아직 없다(다음 작업 후보).
+  - 테스트: `tests/test_restart_recovery.py` — 실제 `GridEngine`+`PaperAdapter`로 시나리오를 만든 뒤 그 엔진 인스턴스를 버리고 새로 재구성해 원래 상태와 비교하는 방식. 정상 경로 6개(IDLE/LADDERING(SL 없음)/LADDERING(SL 있음)/TP_PENDING/hybrid reset 후/`build_recovered_engine`으로 이어서 체결까지) + 불일치 감지 9개. 전체 스위트 94개 통과.
+- **완료(2026-07-30)**: `_reregister_tp`/`_reregister_sl`(`engine/grid_engine.py`)의 `cancel_order` 예외 미처리 수정 — 아래 있던 미해결 항목을 실제로 고쳤다. 기존 TP/SL이 이미 체결/트리거로 사라진 상태에서 취소를 시도해 실패하면, 추측해서 새 주문을 걸지 않고 SL 등록 실패와 동일하게(SPEC 규정) `_force_close_and_halt` + `EngineHaltedError`로 처리하도록 통일했다.
+  - `_force_close_and_halt` 자체도 강화: `halted=True`/`state=CLOSING`을 강제청산 시장가 주문 시도보다 **먼저** 확정하도록 순서를 바꿨다 — 그 시장가 주문마저 실패해도(최악의 경우) 엔진이 halted 판정 없이 "멀쩡한 척" 계속 동작하는 상황을 막기 위함(`_check_not_halted()`가 이후 모든 호출을 막는 유일한 안전장치라 이 플래그가 항상 먼저 서 있어야 함).
+  - 테스트: `tests/test_grid_engine.py`에 3개 추가(TP 취소 실패, SL 취소 실패, 강제청산 시장가 주문마저 실패해도 halted는 반드시 설정됨). 전체 스위트 97개 통과.
+- **완료(2026-07-30)**: `ExchangeAdapter.get_ticker()`/`Ticker` 추가(`exchange/base.py`) — `OrangeXAdapter`는 이미 라이브 검증된 `/public/ticker`(docs/api-notes.md §6 항목15)로, `PaperAdapter`는 마지막 `on_price_tick()` 값을 그대로 돌려주는 방식으로 구현. `config/settings.py`에 `maint_margin_rate`(0.005)/`sl_pct`(0.03, docs/phase1-report.md 확정값)/`price_poll_interval_seconds`(기본 5초, 임의값) 추가.
+- **완료(2026-07-30)**: `main.py` 신규 — 지금까지 만든 조각(GridEngine/FillRouter/EntryScheduler/restart_recovery)을 실제로 조립하는 진입점. `build_grid_rows()`가 실시간 ticker로 base_price를 잡고 `find_max_feasible_step`으로 불가능 단계를 잘라내고 `find_min_order_shortfalls`가 하나라도 있으면 시작을 거부한다(아래 참고). `run()`은 `build_recovered_engine`으로 상태 복구 → `FillRouter`/`EntryScheduler`/현재가 관찰 루프(`_price_watch_loop`, hybrid reset 조건 확인 + PaperAdapter일 때 `on_price_tick` 주입)를 태스크로 묶어 돌리고, 하나라도 예외로 죽으면 전부 취소 후 예외를 올린다(`finally`로 항상 정리 — `run()` 자체가 취소돼도 백그라운드 태스크가 고아로 안 남게 함).
+  - **와이어링하다 발견한 버그 2건, 둘 다 수정**: (1) `config/settings.py`의 `symbol` 기본값이 `"BTC-USDT-PERP"`였는데 OrangeX 실제 instrument_name은 `"BTC-USDT-PERPETUAL"`이다(docs/api-notes.md 다수 항목에서 라이브 확인됨, `strategy/market_data.py`의 바이낸스 심볼 매핑 키도 이 표기를 씀) — 이 기본값으로 실행했으면 `get_contract_spec`/`get_ticker`/RSI 캔들 조달이 전부 조용히 실패했을 것. `"BTC-USDT-PERPETUAL"`로 수정. (2) `run()`이 `asyncio.wait(...)`을 정상적으로 빠져나갈 때만 백그라운드 태스크를 정리했는데, `run()` 자체가 외부에서 취소되면(예: 프로세스 종료 신호) 그 정리 코드에 도달하지 못해 `fill_router`/`entry_scheduler`/`price_watch` 태스크가 고아로 계속 도는 문제가 있었다 — `try/finally`로 모든 종료 경로에서 항상 취소+정리하도록 수정.
+  - **테스트**: `run()` 전체 조립이 실제로 IDLE→SCOUTING→LADDERING까지 도달하고 취소 시 백그라운드 태스크가 고아 없이 정리되는지 확인하는 스모크 테스트(`tests/test_main.py`), `build_grid_rows`/`build_execution_adapter`는 `tests/test_grid_setup.py`로 분리(아래 참고).
+
+- **완료(2026-07-30)**: 다중 사이클 지원. 직전까지는 `GridEngine`이 한 사이클(IDLE→...→COOLDOWN)만 전제해 COOLDOWN 이후 그대로 멈춰 있었다 — 이번에 실제로 채웠다.
+  - `engine/grid_setup.py` 신규 — `main.py`에 있던 `build_grid_rows`/`build_execution_adapter`/`build_market_data_adapter`/`StartupError`를 이쪽으로 옮겼다(`CycleManager`도 동일한 격자 재계산 로직이 필요해서 — `main.py`가 `cycle_manager.py`를 가져오고 `cycle_manager.py`가 `main.py`를 가져오는 순환 참조를 피하려고 공용 모듈로 분리).
+  - `GridEngine.reset_for_new_cycle(grid_rows)` 추가(동기 메서드) — COOLDOWN 상태에서만 호출 가능(그 외 상태면 `ValueError`), halted면 기존과 동일하게 `_check_not_halted()`가 막는다. `filled_step_count`/`resting_grid_order_ids`/`tp_order_id`/`sl_order_id`/`hybrid_reset_done`/`open_qty`를 전부 초기화하고 `state=IDLE`로 되돌린다. 엔진 자신은 시세/설정에 접근권이 없어 새 grid_rows는 호출하는 쪽이 계산해서 넘겨야 한다.
+  - `engine/cycle_manager.py` 신규 — `CycleManager`가 COOLDOWN 진입을 폴링으로 감지하고(`cycle_manager_poll_interval_seconds`, 기본 10초, 임의값), `cooldown_minutes`(기존 설정값, 30분)만큼 기다린 뒤 `build_grid_rows()`로 현재가 기준 새 격자를 계산해 `reset_for_new_cycle()`을 호출한다.
+  - **다중 사이클 지원 작업 중 발견한 진짜 버그, 수정함**: `EntryScheduler.run()`이 IDLE→SCOUTING 전이 체크를 `while True` 루프 진입 **전에 딱 한 번만** 했다. `CycleManager`가 COOLDOWN 이후 상태를 다시 IDLE로 되돌려도, 이미 루프 안에 들어가 있는 스케줄러는 그 체크를 다시 안 해서 두 번째 사이클에 절대 재진입하지 못했을 것 — IDLE 체크를 루프 안으로 옮겨서 매 반복마다 확인하도록 고쳤다.
+  - `main.py`의 `run()`에 `cycle_manager` 태스크를 4번째 백그라운드 태스크로 추가(기존 fill_router/entry_scheduler/price_watch와 동일하게 `asyncio.wait(FIRST_EXCEPTION)` + `finally` 정리 대상).
+  - 테스트: `tests/test_grid_engine.py`에 `reset_for_new_cycle` 3개(정상 초기화/COOLDOWN 아니면 거부/halted면 거부), `tests/test_entry_scheduler.py`에 재진입 버그 회귀 테스트 1개, `tests/test_cycle_manager.py` 신규(COOLDOWN 감지 후 직접 호출로 리셋 검증 + `run()` 백그라운드 루프가 실제로 COOLDOWN을 감지해 자동으로 리셋하는지 end-to-end 1개). 전체 스위트 107개 → **113개 통과**.
+
+- **완료(2026-07-30)**: `OrangeXAdapter.watch_fills()` 구현 — **완전 검증됨(연결/인증/구독/실제 체결 스키마 전부)**. `exchange/orangex/ws_client.py`(`OrangeXWsClient`) 신규. 1차로 연결/인증/구독을 읽기전용 검증했고(`scripts/orangex_probe_ws_fills.py`), 2차로 사용자 명시적 요청 하에 실제 0.001 BTC 체결(진입+즉시청산, 순노출 원복)을 발생시켜 `scripts/orangex_observe_live_fill_ws.py`로 `user.trades.{instrument}.raw` 알림의 실제 필드 스키마까지 캡처했다(docs/api-notes.md §6 항목19). `fee` 필드명이 정확히 "fee"로 확정돼 기존 파싱 코드 수정 없이 그대로 맞았다. `custom_order_id`는 실제 payload에 없었지만 기존 방어 처리(`.get(...,"")`)로 문제없음. 실제 payload를 `tests/test_orangex_adapter.py`의 회귀 테스트로 고정해둠.
+  - `engine/grid_setup.py`의 `build_execution_adapter`가 live 모드에서 `OrangeXWsClient`도 같이 구성해 `OrangeXAdapter`에 넘기도록 배선함.
+  - 테스트: `tests/test_orangex_ws_client.py`(5개), `tests/test_orangex_adapter.py`에 `watch_fills` 관련 8개(실제 라이브 payload 회귀 테스트 포함). 전체 스위트 113개 → **125개 통과**.
+- 새 의존성 추가: `websockets` 패키지(pip install만 함, requirements 파일 없는 프로젝트라 별도 기록 안 됨 — 주의).
+
+- **완료(2026-07-30)**: `place_market_order`의 OrangeX 라이브 검증. 사용자 명시적 요청으로 `scripts/orangex_test_market_order.py` 실행(0.001 BTC 진입 시장가 → 청산 시장가) — 즉시 체결 확인, STOP 주문 같은 crossing-trigger 등 예상 밖 특성 없음. `exchange/base.py`의 `MarketOrderRequest` docstring에서 "라이브 미검증" 문구 제거.
+  - **검증 도중 실제 사고 발생 → 새 버그 발견 및 수정**: 진입 주문은 체결됐는데 직후 `get_order_state` 호출이 `KeyError: 'result'`로 죽어 스크립트가 중단, 청산 못한 LONG 0.001 BTC가 잠깐 미청산 상태로 남았다(수동으로 `scripts/orangex_cleanup_open_long.py`로 정리, 최종 flat 확인). 원인은 이미 문서화돼 있던 §6 항목16(주문 접수 직후 즉시 조회 시 서버 인덱싱 지연)인데, 그동안 "재시도 정책은 사용자와 상의 후 반영"으로 미뤄뒀던 것 — 이번에 실제로 재현된 세 번째 관찰 데이터가 생겨서 `OrangeXAdapter._get_order_state_with_retry()`로 반영했다. 즉시 1회 시도 후 실패하면 2/3/5초 간격으로 최대 3회 재시도(관찰된 "2초 성공"/"5초 반영" 값 그대로, 총 대기 10초), 그래도 실패하면 `OrangeXResponseSchemaError`. `place_limit_order`/`place_stop_order`/`place_market_order` 전부 이 재시도를 쓰도록 통일.
+  - 테스트: `tests/test_orangex_adapter.py`에 `place_market_order` 기본 동작 1개 + 재시도 성공/소진 2개(`QueuedClient`로 같은 메서드가 여러 번 다르게 응답하는 시나리오 지원, `asyncio.sleep` 패치로 실제 대기 없이 검증). 전체 스위트 125개 → **128개 통과**.
+
+- **완료(2026-07-30, 최종)**: ATR 급등 시 격자 간격 확대. 처음엔 사용자에게 배율/공식을 직접 물어서 "지금은 미구현으로 남겨두기"로 보류했었으나, 이후 사용자가 "물어보지 말고 알아서 판단해서 진행"으로 결정 권한을 넘겨줘서 자체 기본값으로 구현했다. `engine/entry_filter.py`에 `compute_atr_tick_multiplier(atr_today, atr_yesterday)` 추가 — 오늘자 ATR(14)이 어제자보다 30% 넘게 크면 그 비율만큼(최대 2배 상한) tick을 넓히고, 아니면 배율 1(변화 없음). 이 임계값(1.3)/상한(2.0) 전부 SPEC/엑셀 근거가 아니라 이 구현이 정한 값임을 코드에 명시해뒀다. `engine/grid_setup.py`의 `build_grid_rows()`가 매 사이클 계산 시 바이낸스 일봉으로 이 배율을 구해 `settings.grid_tick`에 곱한 뒤 `compute_grid()`에 넘긴다(완결 일봉이 부족하면 배율 1 — 값을 추측해서 만들지 않고 보수적으로 미확대).
+  - 리팩터링: `_closed_candles`(당일 진행 중 봉 제외)가 `engine/entry_scheduler.py` 전용이었는데 ATR 쪽도 필요해져서 `strategy/market_data.py`의 공개 함수 `closed_candles()`로 옮기고 양쪽이 공유하도록 정리.
+  - `main.py`/`CycleManager`의 테스트 주입용 파라미터명을 `entry_scheduler_http_client` → `binance_http_client`로 변경(이제 RSI뿐 아니라 ATR도 같은 바이낸스 클라이언트를 씀).
+  - 테스트: `tests/test_entry_filter.py` 신규(RSI 필터 3개 + ATR 배율 5개), `tests/test_grid_setup.py`에 급등 감지/데이터 부족 시 미확대 2개 추가, `tests/test_market_data.py`에 `closed_candles` 이동 테스트 3개. 전체 스위트 135개 → **145개 통과**.
+
+- **완료(2026-07-30)**: halted 상태의 재시작 후 영속화. `engine/halt_flag.py` 신규(`check_halt_flag`/`write_halt_flag`/`clear_halt_flag`) — `main.py`의 `run()`이 시작 시 `check_halt_flag(settings.halt_flag_path)`(기본 `state/halted.json`)를 호출해 플래그가 있으면 아무것도 구성하지 않고 즉시 거부하고, 백그라운드 태스크에서 `EngineHaltedError`가 올라오면 그 시점에 `write_halt_flag()`로 이유를 기록한다. 재개하려면 사람이 거래소 상태를 직접 확인하고 파일을 지워야 한다 — `EngineHaltedError`가 이미 갖고 있던 "수동 확인 후 재개" 철학을 재시작에도 연장한 것. `.gitignore`에 `state/` 추가.
+  - 테스트: `tests/test_halt_flag.py`(5개, 실제 파일 I/O로 검증), `tests/test_main.py`에 2개 추가(플래그 있으면 즉시 거부 / `fill_router`를 통해 실제로 `EngineHaltedError`가 발생했을 때 플래그가 기록되는지 end-to-end — tier4까지 60개 실제 체결 대신 엔진 카운터를 tier4 시점으로 맞추고 그 한 단계만 실제로 체결시켜 FillRouter가 진짜로 처리하게 함). 전체 스위트 128개 → **135개 통과**.
+
+- **완료(2026-07-30)**: `get_open_orders()` OrangeX 라이브 블로커 해소 — **Phase 3 최후의 라이브 블로커였다.** 기존에 실패하던 문서 메서드명(`get_open_order_by_instrument`, 단수형 "order")이 아니라 `/private/get_open_orders_by_instrument`(복수형 "orders")가 실제로 동작함을 확인했다(`scripts/orangex_find_open_orders_endpoint_v2.py`). `get_positions`처럼 "성공은 하지만 항상 빈 배열"인 함정일 수 있어 실제 미체결 주문 하나를 걸고(즉시체결 안 되는 지정가) 조회→나타남 확인→취소→사라짐까지 교차 검증했다(`scripts/orangex_verify_get_open_orders.py`, 읽기전용에 가까운 최소 개입 — 주문 하나 걸고 바로 취소). `exchange/orangex/adapter.py`의 `get_open_orders()`를 이 메서드로 전환. 이걸로 `engine/restart_recovery.py`가 라이브에서도 원칙적으로 동작 가능해졌다(다만 이 모듈 자체를 OrangeX 라이브로 끝까지 기동해본 적은 아직 없음 — 다음 작업). 테스트 스위트 135개 그대로 통과(메서드명만 바뀌고 테스트는 기존 것 갱신).
+
+- **완료(2026-08-04)**: `max_stage` 미구현 발견 및 수정. 다른 컴퓨터로 이어서 작업 시작하며 재점검하다가 `config/settings.py`의 `max_stage`(SPEC 110번 "사용자가 정한 max_stage를 넘는 진입 금지")가 필드로만 존재하고 어떤 엔진 코드에서도 읽히지 않는다는 걸 발견했다 — `engine/grid_engine.py`의 `_refresh_grid_orders()`가 `grid_rows` 길이(가용잔고 기준 feasibility 절삭치, 기본 설정에서 91단계)까지 그대로 진입해, `.env`에 `MAX_STAGE=3`을 넣어도 실제로는 4~5차까지 진입할 수 있는 상태였다.
+  - 수정: `engine/grid_setup.py`의 `build_grid_rows()`에 `settings.max_stage * STEPS_PER_TIER`로 절삭하는 로직을 feasibility 절삭보다 먼저 추가. `CycleManager`도 동일 함수를 재사용하므로 다음 사이클에도 자동 적용됨.
+  - 테스트: `tests/test_grid_setup.py`의 기존 feasibility 절삭 테스트는 `max_stage=5`로 올려 절삭 우선순위를 분리했고, `test_build_grid_rows_truncates_to_max_stage` 신규 추가. `tests/test_main.py`의 tier4 시나리오 테스트도 `max_stage=4`로 명시적으로 올림(기본값 3으로는 tier4에 도달 불가). 전체 스위트 145개 → **146개 통과**.
+  - **참고**: 이 발견은 사용자가 "300 USDT로 이 전략을 돌리면 얼마나 급락까지 버티는지" 질문에 답하려고 `compute_grid`를 직접 돌려보는 과정에서 나왔다 — 그 계산 자체의 결론은: 현재 100단계 weight 프로파일은 min_notional(10 USDT) 제약 때문에 300 USDT로는 최소주문 미달 단계가 64개 발생해 `StartupError`로 시작 자체가 거부된다(병합 로직 미구현, 아래 항목과 동일). equity 크기와 무관하게 청산가는 leverage/weight 구조로만 결정되며, tier5까지 다 채웠다고 가정하면 현재가 대비 약 -11.5% 하락에서 청산된다.
+
+- **완료(2026-08-04)**: `manual_mode` 추가 — 사용자 요청("그냥 현재가 기준으로 무조건 매수/매도 체결하고, tp/sl은 수동으로 하는 모드"). RSI 진입 필터 없이 현재가 기준 격자 진입(매수/매도 체결)만 자동화하고, TP 재등록/SL 등록(4~5차)/hybrid reset(3차+ 50% 자동청산)은 전부 꺼서 청산을 사용자가 거래소에서 직접 수동으로 관리하게 한다. `config/settings.py`에 `manual_mode: bool = False`(기본값 False, 기존 완전자동 동작 그대로 유지) 추가, `.env`는 `MANUAL_MODE=true`로 켠다.
+  - `engine/grid_engine.py`: `GridEngine.manual_mode` 필드 추가. `on_fill()`이 manual_mode면 `_reregister_tp`/`_reregister_sl` 호출을 건너뛰고, 마지막 단계까지 다 체결돼도 `TP_PENDING`으로 넘어가지 않고 `LADDERING`을 유지(TP 자체가 없어 기다릴 상태가 없음). `maybe_hybrid_reset()`은 manual_mode면 맨 앞에서 `False`를 반환해 절대 발동 안 함.
+  - `engine/entry_scheduler.py`: `EntryScheduler(manual_mode=...)` 추가 — SCOUTING 상태에서 RSI 확인(`check_once`) 대신 바로 `start_laddering()`을 호출.
+  - `engine/restart_recovery.py`: manual_mode에서는 (1) 사용자가 거래소에 직접 건 TP/SL 등 봇이 모르는 client_order_id 주문을 만나도 `RestartRecoveryError`로 막지 않고 조용히 건너뛴다(엔진 추적 대상이 아니라고 판단), (2) 포지션이 있는데 TP 미체결 주문이 없어도(TP를 아예 안 걸므로 당연함) 에러 안 냄, (3) tier4+ SL 필수 검증과 hybrid reset 수량 정합성 검증(이론치 cum_qty와 정확히 일치해야 함)을 전부 생략하고 실제 포지션 수량을 추측 없이 그대로 신뢰한다(사용자가 수동으로 부분청산했을 수 있어서). `_parse_client_order_id`/`reconstruct_state`/`build_recovered_engine` 전부 `manual_mode` 파라미터 추가.
+  - `main.py`: `build_recovered_engine`/`EntryScheduler` 생성 시 `settings.manual_mode` 전달.
+  - **알려진 한계**: manual_mode에서는 `on_tp_filled`/`on_sl_filled`가 절대 호출되지 않으므로 `EngineState.COOLDOWN`에 자동으로 도달할 방법이 없다 — `CycleManager`가 COOLDOWN을 기다리는 루프는 무해하게 영원히 대기만 한다(다중 사이클 자동 전환은 manual_mode에서는 사실상 미지원, 필요하면 사용자가 프로세스를 직접 재시작해야 함). 이건 의도된 동작이다(청산 판단 자체를 사용자에게 넘겼으므로 "사이클 종료" 시점도 봇이 알 수 없음).
+  - 테스트: `tests/test_grid_engine.py`(3개), `tests/test_entry_scheduler.py`(1개, RSI 캔들 조회 자체가 호출 안 되는지 검증), `tests/test_restart_recovery.py`(5개), `tests/test_main.py`(1개, end-to-end 와이어링). 전체 스위트 146개 → **156개 통과**.
+
+- **완료(2026-08-04)**: 코드 리뷰로 발견한 버그 3건 수정.
+  1. **[심각] WS 연결 끊김 시 `FillRouter`가 예외 없이 영원히 멈추던 문제.** `exchange/orangex/ws_client.py`의 `_read_loop()`는 `asyncio.create_task()`로 띄워지고 아무도 결과를 기다리지 않아, 연결이 끊기면(재연결/하트비트 정책 자체가 여전히 미확인, §6 항목6/19) 태스크가 조용히 죽고 `notifications()` 큐에는 더 이상 아무것도 안 들어와 `OrangeXAdapter.watch_fills()` → `FillRouter.run()`이 예외 없이 무한 대기했다. `main.py`의 `asyncio.wait(..., FIRST_EXCEPTION)`는 예외가 나야만 감지하므로 이 상황을 절대 못 잡았다 — 봇이 살아있는 것처럼 보이지만 그 순간부터 모든 체결을 인식 못 해 TP/SL 재등록이 조용히 멈추는, SPEC 0번이 우려하는 정확히 그 시나리오였다.
+     - 수정: `_read_loop()`가 연결 종료(정상 EOF든 예외든, `asyncio.CancelledError`로 인한 명시적 `close()`는 제외)를 감지하면 `_CLOSED_SENTINEL`을 큐에 넣어 `notifications()`를 깨우고 `OrangeXWsConnectionClosedError`(또는 원인이 된 원본 예외)를 던지도록 수정. 응답을 기다리던 `call()`들의 pending future도 같이 깨움. **자동 재연결은 의도적으로 구현하지 않음** — 끊긴 동안 놓친 체결이 있을 수 있어 추측 대신 사람이 재시작 후 restart_recovery로 실제 상태를 재확인하게 하는 게 안전하다고 판단.
+     - 테스트: `tests/test_orangex_ws_client.py`에 3개 추가(정상 EOF/네트워크 에러로 인한 종료 각각이 예외를 던지는지, pending call()도 같이 깨어나는지).
+  2. **[중간] `restart_recovery.py`가 정상 상태 하나를 오류로 오판하던 문제.** `start_laddering()` 직후 첫 체결이 나기 전(포지션 flat, 진입 지정가 주문만 미체결)은 완전히 정상인 LADDERING 상태인데, `reconstruct_state()`의 flat 체크가 이 경우도 무조건 `RestartRecoveryError`로 막아서 이 타이밍에 봇이 재시작되면 복구가 원천적으로 불가능했다.
+     - 수정: flat일 때 TP/SL 주문 존재는 여전히 에러로 막되, 미체결 격자 주문만 있는 경우는 index 0부터 연속인지만 확인하고 `LADDERING`(filled_step_count=0)으로 정상 복구하도록 분리.
+     - 테스트: `tests/test_restart_recovery.py` — 기존 `test_flat_position_with_leftover_order_raises`(이제는 정상 케이스이므로 성공 검증으로 교체)를 `test_reconstructs_laddering_with_zero_fills`로 바꾸고, 여전히 막혀야 하는 두 케이스(`test_flat_position_with_tp_order_raises`, `test_flat_position_with_non_contiguous_from_zero_grid_orders_raises`)를 신규 추가.
+  3. **[낮음~중간] `_get_order_state_with_retry`가 `(KeyError, TypeError)`만 재시도하던 문제.** 이 재시도 로직 자체가 실제 사고(주문 체결됐는데 상태조회 실패로 포지션 미청산, §6 항목16) 때문에 만든 건데, 네트워크 순단(`httpx.TransportError`)이나 서버측 일시 오류(`httpx.HTTPStatusError` 5xx)는 재시도 없이 바로 예외를 던져 같은 유형의 사고가 다른 경로로 재발할 여지가 있었다.
+     - 수정: `httpx.TransportError`와 `httpx.HTTPStatusError`(status>=500)도 재시도 대상에 추가. 4xx(인증/파라미터 오류 등 시간이 지나도 해결 안 되는 오류)와 `OrangeXError`(코드별 의미가 불명확한 게 많아 추측 금지)는 여전히 즉시 실패.
+     - 테스트: `tests/test_orangex_adapter.py`에 3개 추가(네트워크 에러 재시도, 5xx 재시도, 4xx는 재시도 없이 즉시 실패).
+  - 전체 스위트 156개 → **164개 통과**.
+
+## 아직 만들지 않은 것 (다음 작업)
+- **최소 주문 미달 단계 병합 로직 실제 구현**: 정책은 이미 결정됐음(docs/phase1-report.md: 다음 단계에 합산). 병합하려면 `compute_grid()`의 누적 계산(cum_qty/avg_price/liq_price/TP/SL이 전부 이전 단계에 순차적으로 의존)을 병합 인식형으로 다시 짜야 하는데, 이건 골든 테스트(`tests/test_golden.py`, 엑셀 원본 대조)가 지키는 핵심 재무 계산이라 서둘러 손대면 실제 계산 오류를 만들 위험이 크다. default 설정에서는 이 상황 자체가 발생 안 함을 확인했고 지금은 안전하게 시작을 거부만 하므로, 실제로 이 상황이 발생하는 설정을 쓰게 될 때 제대로 다시 설계해서 구현하는 게 낫다고 판단해 미룸.
+- **`engine/restart_recovery.py`를 OrangeX 라이브로 실제 기동해서 끝까지 검증**: `get_open_orders()` 블로커는 풀렸지만, 이 모듈이 라이브 데이터로 실제로 상태를 정확히 재구성하는지는 아직 실전 확인 전.
+- **`main.py`를 `trading_mode=live`로 실제 기동**: 지금까지는 전부 개별 조각(watch_fills, place_market_order, get_open_orders 등)을 따로따로 라이브 검증했다 — `main.py` 전체를 live 모드로 처음부터 끝까지 돌려본 적은 없음.
+
+## 미해결 항목
+
+- RSI/ATR용 캔들 데이터 소스 미확인
+- 주문/취소 직후 상태 반영 지연 — `_get_order_state_with_retry()`로 완화했으나 근본 원인(서버측 인덱싱 지연 추정)은 여전히 확정 안 됨
+- `trigger_price_type=1`(mark price) 미검증, 트리거 슬리피지 정도 미확인
