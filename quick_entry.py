@@ -121,8 +121,8 @@ async def run_quick_entry(
         result = await adapter.place_limit_order(order)
         order_ids.append(result.order_id)
         logger.info(
-            "[quick-entry %d/%d] %s %s @ %s USDT | 레버리지 %sx | 진입 마진 %s USDT | order_id=%s",
+            "[quick-entry %d/%d] %s %s @ %s USDT | 레버리지 %sx | 진입 마진 %s USDT",
             row.index + 1, num_chunks, side, row.step_qty, row.entry_price,
-            settings.leverage, row.step_margin, result.order_id,
+            settings.leverage, row.step_margin,
         )
     return order_ids

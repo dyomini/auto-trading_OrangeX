@@ -222,6 +222,20 @@ SPEC.md Phase 3는 원래 "체결마다 TP 취소 후 재등록"과 "4~5차 진�
     통합으로 순감소, 실질 커버리지는 늘어남 — 균등분배 전제였던 낡은 assertion들을
     weights.csv 기반 assertion으로 교체).
 
+- **완료(2026-08-05)**: 즉시 진입 로그 정리 + 레버리지 실행 전 입력 (사용자 요청 —
+  "order_id와 INFO는 안 보여줘도돼. 그리고 레버린지는 그 전에 설정 가능하도록.").
+  - `quick_entry.py`의 주문별 로그에서 `order_id` 제거. `launcher.py`의
+    `logging.basicConfig(...)`에 `format="%(message)s"`를 추가해 `INFO:quick_entry:`
+    같은 로깅 프리픽스 없이 메시지만 그대로 출력하도록 변경.
+  - `launcher.py`: 진입 범위 다음 단계로 레버리지 입력을 추가(`.env`의 `LEVERAGE`가
+    기본값, 이번 실행에만 적용되고 `.env`는 안 바뀜). `Settings().model_copy(update=
+    {"leverage": ...})`로 오버라이드해 미리보기 계산과 실제 실행(`_go()`)이 동일한
+    값을 쓰도록 함(`direction="both"`에서 이미 쓰던 패턴과 동일).
+  - 거래소 쪽 실제 레버리지(`set_leverage`)는 건드리지 않음 — 기존 메인 봇도
+    어디서도 `set_leverage`를 호출하지 않고 `settings.leverage`를 순수 수량 계산용
+    파라미터로만 쓰는 기존 설계를 그대로 따름(실거래소 레버리지는 사용자가 거래소
+    앱에서 직접 맞춰야 함, 기존과 동일한 한계).
+
 ## 아직 만들지 않은 것 (다음 작업)
 - **최소 주문 미달 단계 병합 로직 실제 구현**: 정책은 이미 결정됐음(docs/phase1-report.md: 다음 단계에 합산). 병합하려면 `compute_grid()`의 누적 계산(cum_qty/avg_price/liq_price/TP/SL이 전부 이전 단계에 순차적으로 의존)을 병합 인식형으로 다시 짜야 하는데, 이건 골든 테스트(`tests/test_golden.py`, 엑셀 원본 대조)가 지키는 핵심 재무 계산이라 서둘러 손대면 실제 계산 오류를 만들 위험이 크다. default 설정에서는 이 상황 자체가 발생 안 함을 확인했고 지금은 안전하게 시작을 거부만 하므로, 실제로 이 상황이 발생하는 설정을 쓰게 될 때 제대로 다시 설계해서 구현하는 게 낫다고 판단해 미룸.
 - **`engine/restart_recovery.py`를 OrangeX 라이브로 실제 기동해서 끝까지 검증**: `get_open_orders()` 블로커는 풀렸지만, 이 모듈이 라이브 데이터로 실제로 상태를 정확히 재구성하는지는 아직 실전 확인 전.

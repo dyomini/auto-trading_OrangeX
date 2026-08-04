@@ -193,6 +193,8 @@ def _run_quick_entry() -> None:
     print(" EQUITY_USDT 전액을 배분합니다 — 한 번 실행할 때마다 이 방향에 배정된 자금이")
     print(" 전부 소진됩니다.\n")
 
+    base_settings = Settings()
+
     direction_choice = _ask_choice(
         "방향을 선택하세요.",
         {"1": "숏 (매도 진입)", "2": "롱 (매수 진입)"},
@@ -212,7 +214,11 @@ def _run_quick_entry() -> None:
     else:
         price_range_usdt = _ask_amount("진입 범위(현재가 기준 ±USDT)를 입력하세요", Decimal("3000"))
 
-    settings_preview = Settings()
+    leverage = _ask_amount(
+        f"\n레버리지(배)를 입력하세요 (.env의 LEVERAGE 값과 별개로 이번 실행에만 적용됩니다)",
+        base_settings.leverage,
+    )
+    settings_preview = base_settings.model_copy(update={"leverage": leverage})
     try:
         num_chunks = compute_chunk_count(settings_preview, price_range_usdt)
         preview_rows = compute_preview_rows(settings_preview, num_chunks)
@@ -242,8 +248,9 @@ def _run_quick_entry() -> None:
 
     print("\n주문을 거는 중입니다...\n")
     # quick_entry.py가 주문마다 남기는 레버리지/체결가/진입 마진 로그(사용자 요청)가
-    # 화면에 실제로 보이려면 로깅을 켜야 한다 — main.py의 main()과 동일한 설정.
-    logging.basicConfig(level=logging.INFO)
+    # 화면에 보이도록 로깅을 켠다 — order_id/INFO: 같은 잡음은 안 보이게 메시지만
+    # 그대로 출력하는 포맷을 쓴다(사용자 요청).
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
     async def _go() -> None:
@@ -251,7 +258,7 @@ def _run_quick_entry() -> None:
         from exchange.paper import PaperAdapter
         from quick_entry import run_quick_entry
 
-        settings = Settings()
+        settings = base_settings.model_copy(update={"leverage": leverage})
         market_data_adapter = build_market_data_adapter(settings)
         contract_spec = await market_data_adapter.get_contract_spec(settings.symbol)
         execution_adapter = build_execution_adapter(settings, contract_spec)
