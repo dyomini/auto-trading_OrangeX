@@ -231,6 +231,10 @@ class OrangeXAdapter(ExchangeAdapter):
                     min_qty=Decimal(str(item["min_qty"])),
                     min_notional=Decimal(str(item["min_notional"])),
                     contract_size=Decimal(str(item.get("contract_size", "1"))),
+                    # 2026-08-06 실전 사고로 발견(위 ContractSpec.qty_step 주석 참고):
+                    # min_qty와 별개인 실제 수량 증가 단위. 없으면(구버전 응답 등) 0으로
+                    # 두어 반올림을 적용 안 함 — 추측해서 min_qty를 대신 쓰지 않는다.
+                    qty_step=Decimal(str(item["min_trade_amount"])) if "min_trade_amount" in item else Decimal("0"),
                 )
         raise OrangeXResponseSchemaError(f"get_instruments 응답에서 instrument_name={instrument}을 찾지 못함")
 

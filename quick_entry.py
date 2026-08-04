@@ -34,7 +34,7 @@ import uuid
 from decimal import Decimal
 
 from config.settings import Settings
-from exchange.base import Direction, ExchangeAdapter, OrderRequest
+from exchange.base import ContractSpec, Direction, ExchangeAdapter, OrderRequest, round_qty_to_step
 from strategy.grid import TOTAL_STEPS, GridStepResult, compute_grid
 from strategy.weights import load_weights
 
@@ -89,10 +89,16 @@ async def run_quick_entry(
     direction: Direction,
     price_range_usdt: Decimal,
     adapter: ExchangeAdapter,
+    contract_spec: ContractSpec,
 ) -> list[str]:
     """direction 방향으로 현재가부터 price_range_usdt만큼(grid_tick 간격) 지정가
     주문을 전부 즉시 걸고, 접수된 order_id 목록을 반환한다. 증거금은 weights.csv
-    비중대로 settings.equity_usdt 전액을 배분한다."""
+    비중대로 settings.equity_usdt 전액을 배분한다.
+
+    `contract_spec.qty_step`으로 수량을 거래소가 요구하는 정밀도로 내림한다 —
+    2026-08-06 실전 사고로 발견: compute_grid()의 나눗셈 결과(소수 20자리 이상)를
+    그대로 보내면 거래소가 정밀도 불일치로 주문을 즉시 거부한다(위 모듈 docstring
+    ContractSpec.qty_step 참고)."""
     num_chunks = compute_chunk_count(settings, price_range_usdt)
     weights = load_weights()[:num_chunks]
 
@@ -111,11 +117,20 @@ async def run_quick_entry(
     side = "buy" if direction == "long" else "sell"
     order_ids: list[str] = []
     for row in rows:
+        qty = round_qty_to_step(row.step_qty, contract_spec.qty_step)
+        if qty < contract_spec.min_qty or qty * row.entry_price < contract_spec.min_notional:
+            raise QuickEntryError(
+                f"{row.index + 1}/{num_chunks}번째 단계가 정밀도 반영 후 최소 주문 수량/명목가치에 "
+                f"미달함(qty={qty}, min_qty={contract_spec.min_qty}, min_notional={contract_spec.min_notional}) "
+                "— 증거금이 너무 잘게 쪼개졌습니다. 가격 범위를 줄여 단계 수를 줄이거나 EQUITY_USDT/"
+                "레버리지를 늘려보세요. "
+                f"앞서 접수된 {len(order_ids)}개는 이미 걸려있을 수 있으니 거래소에서 확인하세요."
+            )
         order = OrderRequest(
             instrument=settings.symbol,
             side=side,
             price=row.entry_price,
-            qty=row.step_qty,
+            qty=qty,
             client_order_id=f"quick-{direction}-{row.index}-{uuid.uuid4().hex[:8]}",
         )
         result = await adapter.place_limit_order(order)
@@ -133,7 +148,7 @@ async def run_quick_entry(
         order_ids.append(result.order_id)
         logger.info(
             "[quick-entry %d/%d] %s %s @ %s USDT | 레버리지 %sx | 진입 마진 %s USDT",
-            row.index + 1, num_chunks, side, row.step_qty, row.entry_price,
+            row.index + 1, num_chunks, side, qty, row.entry_price,
             settings.leverage, row.step_margin,
         )
     return order_ids

@@ -14,12 +14,28 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from typing import Literal, Optional
 
 Side = Literal["buy", "sell"]
 Direction = Literal["long", "short"]
 OrderStatus = Literal["open", "partially_filled", "filled", "cancelled", "rejected"]
+
+
+def round_qty_to_step(qty: Decimal, step: Decimal) -> Decimal:
+    """qty를 거래소가 요구하는 수량 증가 단위(step, 예: BTC-USDT-PERPETUAL은 0.001)의
+    배수로 내림한다. 2026-08-06 실전 사고로 발견 — `strategy.grid.compute_grid()`가
+    만드는 수량은 나눗셈 결과라 소수점이 20자리 넘게 이어지는데, 거래소는 정해진
+    정밀도 배수만 받아들여 그렇지 않으면 주문이 즉시 거부된다(ContractSpec.qty_step
+    주석 참고).
+
+    `step<=0`(정밀도 정보를 못 가져온 경우)이면 원본을 그대로 돌려준다 — 추측해서
+    자르지 않고 호출하는 쪽이 최소 정밀도를 실제로 아는 경우에만 적용되게 한다.
+    내림(ROUND_DOWN)을 쓰는 이유: 반올림(HALF_UP)으로 올리면 의도한 증거금/명목가치를
+    넘어설 수 있어, 항상 의도한 값 이하로만 맞춘다."""
+    if step <= 0:
+        return qty
+    return (qty / step).to_integral_value(rounding=ROUND_DOWN) * step
 
 
 @dataclass(frozen=True)
@@ -43,6 +59,15 @@ class ContractSpec:
     min_qty: Decimal
     min_notional: Decimal
     contract_size: Decimal
+    # 2026-08-06 실전 사고로 발견: OrangeX `/public/get_instruments`의 `min_trade_amount`
+    # ("최소 거래 수량 스텝", docs/api-notes.md §4)는 `min_qty`("최소 거래 수량")와 별개
+    # 필드다 — 주문 수량은 이 값의 배수여야 한다(BTC-USDT-PERPETUAL 기준 0.001). 기존
+    # 코드 어디서도 이 필드를 반영하지 않아 compute_grid()가 만든 고정밀도 소수 수량
+    # (예: 0.006760034349168474805147131123)을 그대로 주문에 넣었고, 실전에서 이 정밀도
+    # 불일치로 주문이 즉시 거부됐다(quick_entry.py 실전 실행 2회 연속 실패, 원인 규명 후
+    # 발견). 기본값 0은 "미확인/반영 안 함"을 뜻하며 기존 테스트 호출부와 하위호환된다
+    # — 반올림이 필요한 곳(quick_entry.py 등)은 실제 조회한 값을 명시적으로 넘겨야 한다.
+    qty_step: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True)

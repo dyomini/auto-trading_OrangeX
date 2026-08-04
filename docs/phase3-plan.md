@@ -294,7 +294,55 @@ SPEC.md Phase 3는 원래 "체결마다 TP 취소 후 재등록"과 "4~5차 진�
     명시적 요청 있을 때만 라이브 테스트 진행하는 SPEC 0번 원칙) — 다음에 사용자가
     실전으로 다시 시도할 때 이번엔 거래소에 실제로 주문이 걸리는지 반드시 확인 필요.
 
+- **완료(2026-08-06, 두 번째 실전 사고 수정)**: position_side 수정 후에도 사용자가
+  실전으로 다시 시도했는데 또 안 됐다("또 했는데 안돼"). 읽기전용 재조회 결과 이번에도
+  새 주문이 하나도 안 걸려있었음(위험한 부분체결 없음). 진짜 근본 원인을 찾음:
+  **`min_trade_amount`(수량 증가 단위, 예: BTC 0.001) 필드를 코드 어디서도 반영한 적이
+  없었다.** `docs/api-notes.md` §4에 이미 문서화돼 있었지만(`min_qty`와 별개 필드로
+  명시) `exchange/base.py`의 `ContractSpec`에는 애초에 이 필드가 없었다 — `compute_grid()`
+  는 나눗셈으로 수량을 계산하므로 결과가 `0.006760034349168474805147131123`처럼 소수점
+  20자리 넘게 이어지는데, 이런 값을 그대로 주문에 넣으면 거래소가 정밀도 불일치로 즉시
+  거부한다(라이브 `/public/get_instruments` 재조회로 BTC-USDT-PERPETUAL의 `min_trade_
+  amount="0.001"`, `quantityPrec=3` 확인).
+  - **왜 이전까지 아무도 못 봤는지**: 지금까지 라이브로 검증됐던 모든 주문 스크립트
+    (`scripts/orangex_test_market_order.py` 등)는 전부 `"0.001"` 같은 손으로 쓴 깔끔한
+    값만 썼다 — `compute_grid()`가 만든 실제 계산값을 라이브로 보낸 건 quick_entry가
+    처음이었다. **`engine/grid_engine.py`(메인 자동매매 봇)도 정확히 동일하게 `row.
+    step_qty`를 반올림 없이 그대로 주문에 넣는다** — `main.py`를 `trading_mode=live`로
+    끝까지 기동해본 적이 아직 없어서(기존에 알려진 한계) 이 문제가 지금까지 드러나지
+    않았을 뿐, 메인 봇도 실전에서는 100% 동일하게 실패할 것이다. **메인 봇은 아직
+    이 수정을 반영 안 함 — 다음 작업으로 반드시 처리할 것.**
+  - **수정(quick_entry.py만)**: `ContractSpec`에 `qty_step: Decimal = Decimal("0")`
+    필드 추가(기본값 0="미확인"은 기존 테스트 호출부 전부와 하위호환). `OrangeXAdapter.
+    get_contract_spec()`이 `min_trade_amount`를 파싱해 채움. `exchange/base.py`에
+    `round_qty_to_step(qty, step)` 공용 헬퍼 신규(내림 — 반올림으로 올리면 의도한
+    증거금을 넘어설 수 있어서). `quick_entry.py`의 `run_quick_entry()`에 `contract_spec`
+    파라미터 추가, 주문 걸기 전 `round_qty_to_step()`으로 내림하고 반올림 후 min_qty/
+    min_notional 미달이면 `QuickEntryError`로 명확히 막음(애매하게 잘려서 거래소가 또
+    조용히 거부하게 두지 않음). `launcher.py`가 이미 갖고 있던 `contract_spec`을 그대로
+    전달하도록 배선.
+  - **테스트**: `tests/test_quick_entry.py`의 `make_spec()` 기본값을 실제 BTC 값(qty_
+    step=0.001)으로 바꾸고, 순수 비중 계산만 검증하던 기존 테스트들은 `qty_step=0`
+    으로 명시해 반올림 간섭을 배제. 신규 2개(수량이 0.001 배수로 내림되는지, 반올림
+    후 미달 시 명확한 에러). 전체 스위트 185개 그대로 통과(신규 2개 + 조정).
+  - paper 모드 스모크로 확인: 이전엔 `0.006760034349168474805147131123` 같던 로그의
+    수량이 이제 `0.006`처럼 깔끔하게 나온다(연습 모드도 실제 라이브 계약스펙을 조회해
+    쓰므로 이 수정이 그대로 반영됨).
+  - **다음 확인 필요(우선순위 높음)**: (1) 이번에도 라이브 재검증은 안 함 — 다음 실전
+    시도 때 실제로 주문이 걸리는지 확인. (2) **`engine/grid_engine.py`에 동일한 반올림
+    로직을 적용하는 작업이 시급함** — 지금 상태로 메인 봇을 라이브로 켜면 quick_entry와
+    똑같이 모든 주문이 조용히(또는 이번 quick_entry 수정 이후엔 최소한 명시적 에러로)
+    실패할 것이다.
+
 ## 아직 만들지 않은 것 (다음 작업)
+- **[긴급/안전] `engine/grid_engine.py`에 수량 정밀도(qty_step) 반올림 적용**: quick_entry.py는
+  2026-08-06에 고쳤지만(`round_qty_to_step()`, `exchange/base.py`), 메인 자동매매 봇
+  (`_refresh_grid_orders`/`_reregister_tp`/`_reregister_sl`/`_force_close_and_halt`/
+  `maybe_hybrid_reset` — `engine/grid_engine.py`)은 여전히 `compute_grid()`의 미가공
+  수량을 그대로 주문에 넣는다. **지금 상태로 메인 봇을 라이브로 켜면 모든 주문이 거래소
+  정밀도 불일치로 실패할 것**(quick_entry가 겪은 것과 동일 원인). `GridEngine`이 `contract_
+  spec`(또는 최소 `qty_step`)을 갖고 있지 않아 생성자/`build_recovered_engine`/`CycleManager`
+  까지 함께 손봐야 하는 더 큰 변경 — 메인 봇을 라이브로 켜기 전 반드시 먼저 처리할 것.
 - **최소 주문 미달 단계 병합 로직 실제 구현**: 정책은 이미 결정됐음(docs/phase1-report.md: 다음 단계에 합산). 병합하려면 `compute_grid()`의 누적 계산(cum_qty/avg_price/liq_price/TP/SL이 전부 이전 단계에 순차적으로 의존)을 병합 인식형으로 다시 짜야 하는데, 이건 골든 테스트(`tests/test_golden.py`, 엑셀 원본 대조)가 지키는 핵심 재무 계산이라 서둘러 손대면 실제 계산 오류를 만들 위험이 크다. default 설정에서는 이 상황 자체가 발생 안 함을 확인했고 지금은 안전하게 시작을 거부만 하므로, 실제로 이 상황이 발생하는 설정을 쓰게 될 때 제대로 다시 설계해서 구현하는 게 낫다고 판단해 미룸.
 - **`engine/restart_recovery.py`를 OrangeX 라이브로 실제 기동해서 끝까지 검증**: `get_open_orders()` 블로커는 풀렸지만, 이 모듈이 라이브 데이터로 실제로 상태를 정확히 재구성하는지는 아직 실전 확인 전.
 - **`main.py`를 `trading_mode=live`로 실제 기동**: 지금까지는 전부 개별 조각(watch_fills, place_market_order, get_open_orders 등)을 따로따로 라이브 검증했다 — `main.py` 전체를 live 모드로 처음부터 끝까지 돌려본 적은 없음.

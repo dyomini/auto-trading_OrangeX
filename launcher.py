@@ -339,7 +339,7 @@ def _run_quick_entry() -> None:
             ticker = await market_data_adapter.get_ticker(settings.symbol)
             await execution_adapter.on_price_tick(ticker.last_price)
         try:
-            order_ids = await run_quick_entry(settings, direction, price_range_usdt, execution_adapter)
+            order_ids = await run_quick_entry(settings, direction, price_range_usdt, execution_adapter, contract_spec)
         except QuickEntryError as e:
             print(f"\n실행하지 못했습니다: {e}")
             return

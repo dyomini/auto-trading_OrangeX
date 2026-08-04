@@ -9,6 +9,10 @@ price_range_usdt // grid_tick으로 정해진다.
 진입 마진 설계"). weights.csv의 앞 5개 값(10,11,12,13,14)과 equity_usdt=10000,
 leverage=20 기준으로 손계산한 값(1666.7/1833.3/2000.0/2166.7/2333.3, 합계 10000.0
 정확히 일치)을 그대로 회귀 기준으로 쓴다.
+
+수량 정밀도(qty_step) 테스트는 make_spec()의 기본값 0.001(실제 BTC-USDT-PERPETUAL의
+min_trade_amount, 2026-08-06 실전 사고로 발견)을 쓴다 — 순수 비중 계산만 검증하고
+싶은 테스트는 qty_step=0("미확인/반영 안 함")으로 명시해 반올림 간섭을 없앤다.
 """
 from __future__ import annotations
 
@@ -62,16 +66,18 @@ def make_settings(**overrides) -> Settings:
     return Settings(**defaults)
 
 
-def make_spec() -> ContractSpec:
+def make_spec(qty_step: Decimal = Decimal("0.001")) -> ContractSpec:
+    # qty_step 기본값 0.001은 실제 BTC-USDT-PERPETUAL의 min_trade_amount(2026-08-06
+    # 실전 조회로 확인, docs/api-notes.md §4) 그대로다.
     return ContractSpec(
-        instrument=INSTRUMENT, tick_size=Decimal("0.1"), min_qty=Decimal("0.0001"),
-        min_notional=Decimal("10"), contract_size=Decimal("1"),
+        instrument=INSTRUMENT, tick_size=Decimal("0.1"), min_qty=Decimal("0.001"),
+        min_notional=Decimal("10"), contract_size=Decimal("1"), qty_step=qty_step,
     )
 
 
-async def make_adapter(last_price: str = "64000") -> PaperAdapter:
+async def make_adapter(last_price: str = "64000", qty_step: Decimal = Decimal("0.001")) -> PaperAdapter:
     adapter = PaperAdapter(
-        instrument=INSTRUMENT, contract_spec=make_spec(), initial_equity=Decimal("10000"),
+        instrument=INSTRUMENT, contract_spec=make_spec(qty_step), initial_equity=Decimal("10000"),
         leverage=Decimal("20"), maker_fee=Decimal("0.0002"), taker_fee=Decimal("0.0006"),
     )
     await adapter.on_price_tick(Decimal(last_price))
@@ -101,10 +107,11 @@ def test_compute_preview_rows_follows_weights_csv_proportions():
 
 @pytest.mark.asyncio
 async def test_short_places_orders_at_increasing_prices_with_weighted_margin():
+    # qty_step=0(반올림 없음)으로 순수 비중 계산만 검증 — 반올림 오차는 별도 테스트에서.
     settings = make_settings()
-    adapter = await make_adapter("64000")
+    adapter = await make_adapter("64000", qty_step=Decimal("0"))
 
-    order_ids = await run_quick_entry(settings, "short", Decimal("250"), adapter)
+    order_ids = await run_quick_entry(settings, "short", Decimal("250"), adapter, adapter.contract_spec)
 
     assert len(order_ids) == 5  # 250 // grid_tick(50)
     open_orders = await adapter.get_open_orders(INSTRUMENT)
@@ -126,7 +133,7 @@ async def test_long_places_orders_at_decreasing_prices():
     settings = make_settings()
     adapter = await make_adapter("64000")
 
-    order_ids = await run_quick_entry(settings, "long", Decimal("150"), adapter)
+    order_ids = await run_quick_entry(settings, "long", Decimal("150"), adapter, adapter.contract_spec)
 
     assert len(order_ids) == 3  # 150 // grid_tick(50)
     prices = sorted(o.request.price for o in adapter._open_orders.values())
@@ -138,11 +145,11 @@ async def test_long_places_orders_at_decreasing_prices():
 async def test_total_margin_equals_equity_regardless_of_chunk_count():
     # 청크 개수가 달라도(가격 범위가 달라도) 총 증거금은 항상 equity_usdt 전액이어야
     # 한다 — weights.csv 슬라이스가 재정규화되기 때문(2026-08-04 max_stage 버그 수정과
-    # 동일한 원리, engine/grid_setup.py 참고).
+    # 동일한 원리, engine/grid_setup.py 참고). qty_step=0으로 반올림 오차를 배제한다.
     settings = make_settings()
-    adapter = await make_adapter("64000")
+    adapter = await make_adapter("64000", qty_step=Decimal("0"))
 
-    await run_quick_entry(settings, "short", Decimal("100"), adapter)  # 2 chunks
+    await run_quick_entry(settings, "short", Decimal("100"), adapter, adapter.contract_spec)  # 2 chunks
 
     total_margin = sum(
         internal.request.qty * internal.request.price / settings.leverage
@@ -157,7 +164,7 @@ async def test_range_below_tick_size_raises():
     adapter = await make_adapter("64000")
 
     with pytest.raises(QuickEntryError):
-        await run_quick_entry(settings, "short", Decimal("30"), adapter)
+        await run_quick_entry(settings, "short", Decimal("30"), adapter, adapter.contract_spec)
 
 
 @pytest.mark.asyncio
@@ -169,7 +176,7 @@ async def test_chunk_count_over_100_raises():
     adapter = await make_adapter("64000")
 
     with pytest.raises(QuickEntryError):
-        await run_quick_entry(settings, "short", Decimal("5050"), adapter)  # 101 chunks
+        await run_quick_entry(settings, "short", Decimal("5050"), adapter, adapter.contract_spec)  # 101 chunks
 
 
 @pytest.mark.asyncio
@@ -177,7 +184,7 @@ async def test_chunk_count_exactly_100_succeeds():
     settings = make_settings()
     adapter = await make_adapter("64000")
 
-    order_ids = await run_quick_entry(settings, "short", Decimal("5000"), adapter)
+    order_ids = await run_quick_entry(settings, "short", Decimal("5000"), adapter, adapter.contract_spec)
 
     assert len(order_ids) == 100
 
@@ -198,7 +205,7 @@ async def test_immediately_cancelled_order_raises_instead_of_reporting_success()
     await adapter.on_price_tick(Decimal("64000"))
 
     with pytest.raises(QuickEntryError):
-        await run_quick_entry(settings, "short", Decimal("250"), adapter)
+        await run_quick_entry(settings, "short", Decimal("250"), adapter, adapter.contract_spec)
 
 
 @pytest.mark.asyncio
@@ -212,7 +219,35 @@ async def test_partial_rejection_stops_and_raises():
     await adapter.on_price_tick(Decimal("64000"))
 
     with pytest.raises(QuickEntryError):
-        await run_quick_entry(settings, "short", Decimal("250"), adapter)  # 5 chunks, 3rd gets rejected
+        await run_quick_entry(settings, "short", Decimal("250"), adapter, adapter.contract_spec)  # 5 chunks, 3rd rejected
 
     open_orders = await adapter.get_open_orders(INSTRUMENT)
     assert len(open_orders) == 2  # 앞의 2개는 정상 접수됨 — 3번째에서 멈춤
+
+
+@pytest.mark.asyncio
+async def test_qty_rounded_down_to_exchange_step():
+    # 2026-08-06 실전 사고 회귀 테스트: compute_grid()가 만드는 수량은 나눗셈 결과라
+    # 소수점이 20자리 넘게 이어진다 — 거래소 정밀도(qty_step=0.001)의 배수로 내림해서
+    # 보내야 한다. 안 그러면 실전에서 정밀도 불일치로 주문이 즉시 거부된다.
+    settings = make_settings()
+    adapter = await make_adapter("64000", qty_step=Decimal("0.001"))
+
+    await run_quick_entry(settings, "short", Decimal("250"), adapter, adapter.contract_spec)
+
+    for internal in adapter._open_orders.values():
+        qty = internal.request.qty
+        # qty가 0.001의 정수배인지 확인 — 나머지가 정확히 0이어야 한다.
+        assert (qty / Decimal("0.001")) == (qty / Decimal("0.001")).to_integral_value()
+
+
+@pytest.mark.asyncio
+async def test_shortfall_after_rounding_raises_clear_error():
+    # 증거금이 너무 잘게 쪼개져서(예: 매우 좁은 범위 + 낮은 레버리지) 반올림 후 qty가
+    # min_qty/min_notional에 못 미치면, 거래소에 보내기 전에 명확한 QuickEntryError로
+    # 막아야 한다 — 애매하게 잘려서 거래소가 또 조용히 거부하게 두면 안 된다.
+    settings = make_settings(equity_usdt=Decimal("5"), leverage=Decimal("1"))
+    adapter = await make_adapter("64000", qty_step=Decimal("0.001"))
+
+    with pytest.raises(QuickEntryError):
+        await run_quick_entry(settings, "short", Decimal("250"), adapter, adapter.contract_spec)
