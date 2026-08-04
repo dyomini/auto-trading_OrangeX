@@ -147,6 +147,35 @@ SPEC.md Phase 3는 원래 "체결마다 TP 취소 후 재등록"과 "4~5차 진�
     - **효과**: 라이브 가격/leverage=40/max_stage=3 기준 최소 시드가 수정 전 약 2,832 USDT에서 수정 후 약 **548 USDT**로 감소(같은 3-tier 구조에 자금이 낭비 없이 배정되므로).
   - 테스트: `tests/test_grid_setup.py`에 재정규화 검증 신규 1개(`test_build_grid_rows_renormalizes_weights_to_active_tiers`) + 기존 `test_build_grid_rows_truncates_to_max_stage` 업데이트(feasibility가 60단계보다 먼저 걸리는 게 이제 정상임을 반영), `tests/test_grid_engine.py`/`tests/test_restart_recovery.py`에 커스텀 `mandatory_sl_min_tier` 관련 신규 3개. `tests/test_main.py`의 `direction="both"` 테스트도 새 증거금 배정값(28.3, 이전 5.8)으로 갱신. 전체 스위트 170개 → **174개 통과**.
 
+- **완료(2026-08-05)**: 즉시 진입("숏!"/"롱!") 도구 추가 — 사용자 요청("지금 숏! 하면 현재가부터
+  50테더씩 타더더덕 체결되게끔 하는 모드도 추가해줘"). 명확화 결과: launcher.py 메뉴에 추가,
+  총 금액(3k/5k/직접입력)을 사용자가 정하고 그걸 50 USDT(설정 가능, `QUICK_ENTRY_CHUNK_USDT`)
+  단위로 나눠 지정가 주문을 명령 입력 시점에 전부 한 번에 예약 걸어두는 방식, TP/SL은
+  manual_mode와 동일하게 사용자가 직접 관리.
+  - `quick_entry.py` 신규 — `run_quick_entry()`가 `strategy.grid.compute_grid()`를 그대로
+    재사용한다(weights를 전부 1로 균등하게 줘서 청크마다 동일 증거금이 배정되게 함 — 새
+    재무 공식을 만들지 않고 골든 테스트가 지키는 검증된 계산을 그대로 씀). `engine/grid_engine.py`의
+    정식 엔진과는 완전히 독립적 — RSI 필터/TP 재등록/SL 등록/hybrid reset 전부 없음.
+  - `config/settings.py`에 `quick_entry_chunk_usdt: Decimal = 50` 추가.
+  - `launcher.py`: 최상위 메뉴를 "[0] 무엇을 할까요?"로 바꿔 "봇 실행"/"즉시 진입" 분기.
+    기존 `main()` 본문은 `_run_bot()`으로 분리(하위호환, 동작 동일). 즉시 진입은 방향(숏/롱)
+    → 총 금액(3k/5k/직접입력) → 연습/실전 모드를 순서대로 물어보고, 실전이면 봇 실행과
+    동일한 이중 확인 절차(먼저 `_configure_mode()`의 일반 경고, 이어서 방향/금액을 명시한
+    두 번째 확인)를 거친다.
+  - **구현 중 발견한 버그, 수정함**: (1) `compute_grid()`는 100단계(`TOTAL_STEPS`)까지만
+    받는데(strategy/grid.py), quick_entry가 청크 개수를 그대로 넘기다 보니 청크 100개를
+    넘는 조합(예: 총액 10만/청크 50=2000개)에서 어댑터/엔진과 무관한 원본 `ValueError`가
+    그대로 새어나갔다 — `num_chunks > TOTAL_STEPS`를 명시적으로 검증해 `QuickEntryError`로
+    막도록 수정(총액을 줄이거나 청크를 키우라고 안내). (2) launcher.py의 연습 모드 경로에서
+    `PaperAdapter`가 갓 생성돼 현재가를 모르는 상태(`on_price_tick` 미호출)라 `get_ticker()`가
+    `NoKnownPriceError`로 죽었다 — main.py의 상시 가격관찰 루프가 하던 일을 launcher가 대신
+    실행 직전에 한 번 `market_data_adapter.get_ticker()`로 조회해 주입하도록 수정.
+  - **테스트**: `tests/test_quick_entry.py` 신규(7개 — 방향별 가격 진행/청크당 균등 증거금/나머지
+    버림/총액 미달 시 에러/100개 초과 시 에러/정확히 100개 성공). 전체 스위트 174개 → **181개
+    통과**. 추가로 pytest 밖에서 direction×amount×chunk 23개 조합 탐색 스모크(총액 0/음수/소수점/
+    거대값/청크 크기 커스텀 등)와 launcher.py 대화형 흐름을 다양한 입력(정상/비정상 숫자,
+    실전 확인 취소 등)으로 in-process stdin 재현 검증 — 전부 paper 모드로만 실행, 실주문 없음.
+
 ## 아직 만들지 않은 것 (다음 작업)
 - **최소 주문 미달 단계 병합 로직 실제 구현**: 정책은 이미 결정됐음(docs/phase1-report.md: 다음 단계에 합산). 병합하려면 `compute_grid()`의 누적 계산(cum_qty/avg_price/liq_price/TP/SL이 전부 이전 단계에 순차적으로 의존)을 병합 인식형으로 다시 짜야 하는데, 이건 골든 테스트(`tests/test_golden.py`, 엑셀 원본 대조)가 지키는 핵심 재무 계산이라 서둘러 손대면 실제 계산 오류를 만들 위험이 크다. default 설정에서는 이 상황 자체가 발생 안 함을 확인했고 지금은 안전하게 시작을 거부만 하므로, 실제로 이 상황이 발생하는 설정을 쓰게 될 때 제대로 다시 설계해서 구현하는 게 낫다고 판단해 미룸.
 - **`engine/restart_recovery.py`를 OrangeX 라이브로 실제 기동해서 끝까지 검증**: `get_open_orders()` 블로커는 풀렸지만, 이 모듈이 라이브 데이터로 실제로 상태를 정확히 재구성하는지는 아직 실전 확인 전.

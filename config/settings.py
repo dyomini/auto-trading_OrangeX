@@ -61,6 +61,9 @@ class Settings(BaseSettings):
     # 자동화는 전부 끈 채 사용자가 거래소에서 직접 수동으로 관리하는 모드.
     # 기본값 False(기존 완전자동 동작 그대로 유지).
     manual_mode: bool = False
+    # 2026-08-05 사용자 요청: "숏!"/"롱!" 즉시 진입 모드(quick_entry.py, launcher.py 메뉴)의
+    # 청크 단위. RSI/hybrid reset 등 나머지 자동화와 무관하게 이 값만 쓴다.
+    quick_entry_chunk_usdt: Decimal = Decimal("50")
 
     @field_validator("daily_loss_limit_pct", mode="before")
     @classmethod
