@@ -122,6 +122,7 @@ async def _run_single_direction(
             grid_rows,
             max_open_grid_orders=settings.max_open_grid_orders,
             manual_mode=settings.manual_mode,
+            mandatory_sl_min_tier=settings.mandatory_sl_min_tier,
         )
     except RestartRecoveryError as e:
         raise StartupError(f"재시작 복구 실패 — 거래소 상태와 격자 계산이 안 맞음: {e!r}") from e

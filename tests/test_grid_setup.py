@@ -123,8 +123,13 @@ async def test_build_grid_rows_truncates_infeasible_steps():
 
 @pytest.mark.asyncio
 async def test_build_grid_rows_truncates_to_max_stage():
-    # SPEC 110번 "max_stage를 넘는 진입 금지" — max_stage=3(기본값)이면 91단계(feasibility
-    # 한도)까지 가기 전에 3*20=60단계에서 먼저 잘려야 한다.
+    # SPEC 110번 "max_stage를 넘는 진입 금지" — max_stage=3이면 4~5차(tier4/5) 가중치는
+    # 애초에 compute_grid()에 넘어가지도 않는다(2026-08-04, weight_sum 재정규화로 수정 —
+    # 3k 참고 설계와 동일하게 활성 tier에 equity 전액이 배정되도록). 그 결과 이 equity/
+    # leverage 조합에서는 feasibility(가용잔고 소진)가 60단계보다 먼저(54단계) 걸린다 —
+    # 이전(재정규화 전)에는 equity 대부분이 미배정으로 남아 60단계 전부 feasible했지만,
+    # 그건 자금 비효율의 결과였다. 어느 쪽이든 tier4/5로는 절대 안 들어가야 한다는
+    # 핵심만 검증한다.
     settings = make_settings(max_stage=3)
     market_data_adapter = make_market_data_adapter()
     contract_spec = await market_data_adapter.get_contract_spec(INSTRUMENT)
@@ -133,8 +138,33 @@ async def test_build_grid_rows_truncates_to_max_stage():
     rows = await build_grid_rows(settings, market_data_adapter, contract_spec, binance_client)
     await binance_client.aclose()
 
-    assert len(rows) == 60
+    assert len(rows) <= 60
+    assert all(r.major_tier <= 3 for r in rows)
     assert rows[-1].major_tier == 3
+
+
+@pytest.mark.asyncio
+async def test_build_grid_rows_renormalizes_weights_to_active_tiers():
+    # 2026-08-04 수정 검증: max_stage로 잘라낸 뒤에도 weight_sum이 예전처럼 100단계
+    # 전체(17130) 기준이면 안 되고, 실제로 쓰이는 tier들의 가중치 합만으로 재정규화돼야
+    # equity가 낭비 없이 배정된다. max_stage=3(가중치 합 3530)에서 1단계 증거금이
+    # max_stage=5(가중치 합 17130)보다 커야 한다 — 같은 equity를 더 적은 단계에 나눠
+    # 쓰니까 단계당 몫이 커지는 게 당연하다.
+    market_data_adapter = make_market_data_adapter()
+    contract_spec = await market_data_adapter.get_contract_spec(INSTRUMENT)
+
+    binance_client_3 = make_flat_binance_client()
+    rows_stage3 = await build_grid_rows(make_settings(max_stage=3), market_data_adapter, contract_spec, binance_client_3)
+    await binance_client_3.aclose()
+
+    binance_client_5 = make_flat_binance_client()
+    rows_stage5 = await build_grid_rows(make_settings(max_stage=5), market_data_adapter, contract_spec, binance_client_5)
+    await binance_client_5.aclose()
+
+    assert rows_stage3[0].step_margin > rows_stage5[0].step_margin
+    # 정확한 배율까지 확인: 3530 vs 17130 (config/weights.csv 실제 합), quantize 오차 감안 1% 이내
+    expected = rows_stage5[0].step_margin * Decimal("17130") / Decimal("3530")
+    assert abs(rows_stage3[0].step_margin - expected) / expected < Decimal("0.01")
 
 
 @pytest.mark.asyncio

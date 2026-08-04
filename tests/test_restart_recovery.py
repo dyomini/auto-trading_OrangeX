@@ -114,6 +114,47 @@ async def test_reconstructs_laddering_with_sl_at_tier4():
 
 
 @pytest.mark.asyncio
+async def test_reconstructs_laddering_with_sl_at_tier3_using_custom_mandatory_sl_min_tier():
+    # 2026-08-04: mandatory_sl_min_tier=3(3-tier 압축 설계)로 GridEngine을 운용했다면
+    # reconstruct_state()에도 같은 값을 넘겨야 tier3에서 SL이 필수라고 올바르게 판단한다.
+    adapter = make_adapter()
+    rows = make_grid_rows()
+    old_engine = GridEngine(
+        adapter=adapter, instrument=INSTRUMENT, direction="long", grid_rows=rows,
+        max_open_grid_orders=5, mandatory_sl_min_tier=3,
+    )
+    await old_engine.start_laddering()
+    for idx in (0, 1, 2):  # idx2 = major_tier 3
+        await fill_grid_index(adapter, old_engine, rows, idx)
+    assert old_engine.sl_order_id is not None
+
+    recovered = await reconstruct_state(adapter, INSTRUMENT, rows, "long", mandatory_sl_min_tier=3)
+
+    assert recovered.state == EngineState.LADDERING
+    assert recovered.filled_step_count == 3
+    assert recovered.sl_order_id == old_engine.sl_order_id
+    assert recovered.sl_order_id is not None
+
+
+@pytest.mark.asyncio
+async def test_reconstruct_state_default_mandatory_sl_min_tier_rejects_tier3_sl():
+    # 위 테스트와 반대 방향 확인: mandatory_sl_min_tier를 넘기지 않으면(기본값 4) tier3에
+    # SL이 있는 상태를 "예상 밖"으로 거부해야 한다 — 두 설정이 일관되게 맞물려야 함을 보장.
+    adapter = make_adapter()
+    rows = make_grid_rows()
+    old_engine = GridEngine(
+        adapter=adapter, instrument=INSTRUMENT, direction="long", grid_rows=rows,
+        max_open_grid_orders=5, mandatory_sl_min_tier=3,
+    )
+    await old_engine.start_laddering()
+    for idx in (0, 1, 2):
+        await fill_grid_index(adapter, old_engine, rows, idx)
+
+    with pytest.raises(RestartRecoveryError, match="SL 주문이 존재함"):
+        await reconstruct_state(adapter, INSTRUMENT, rows, "long")  # mandatory_sl_min_tier 기본값(4)
+
+
+@pytest.mark.asyncio
 async def test_reconstructs_tp_pending_when_all_rows_filled():
     adapter = make_adapter()
     rows = make_grid_rows()

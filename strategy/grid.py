@@ -68,8 +68,13 @@ def compute_grid(
     maint_margin_rate: Decimal,
     sl_pct: Decimal = Decimal("0.03"),
 ) -> list[GridStepResult]:
-    if len(weights) != TOTAL_STEPS:
-        raise ValueError(f"weights must have {TOTAL_STEPS} entries, got {len(weights)}")
+    # max_stage로 앞쪽 N개 tier만 쓰는 압축 구조(2026-08-04, "3k" 참고 설계)를 지원하려고
+    # 정확히 TOTAL_STEPS개가 아니라 1..TOTAL_STEPS개까지 허용한다. weight_sum이 넘겨받은
+    # weights 리스트 전체를 기준으로 계산되므로(아래), 앞쪽 N개만 잘라 넘기면 그 N개
+    # 안에서 비중이 재정규화된다 — engine/grid_setup.py가 max_stage 절삭을 여기 넘기기
+    # *전에* 적용해서 이 효과를 낸다.
+    if not (1 <= len(weights) <= TOTAL_STEPS):
+        raise ValueError(f"weights must have 1..{TOTAL_STEPS} entries, got {len(weights)}")
 
     weight_sum = sum(weights)
     results: list[GridStepResult] = []

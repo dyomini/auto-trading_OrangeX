@@ -45,7 +45,6 @@ from strategy.grid import GridStepResult
 from strategy.liquidation import Direction
 
 HYBRID_RESET_MIN_TIER = 3
-MANDATORY_SL_MIN_TIER = 4
 HYBRID_RESET_FRACTION = Decimal("0.5")
 
 
@@ -75,6 +74,11 @@ class GridEngine:
     # 전부 건너뛴다 — 청산은 사용자가 거래소에서 직접 수동으로 관리한다는 전제
     # (config/settings.py의 manual_mode, 2026-08-04 사용자 요청).
     manual_mode: bool = False
+    # 이 tier 이상 진입 시 거래소 SL 필수 등록(config/settings.py의 mandatory_sl_min_tier).
+    # 기본값 4는 5-tier 풀 구조(SPEC 원안, "4~5차") 기준 — max_stage를 낮춰 쓰면
+    # (예: 3-tier 압축 설계) 이 값도 같이 낮춰야 major_tier가 실제로 도달 가능한
+    # 값이 된다(2026-08-04, 제까깟-마틴게이-3k.xlsx 검증 후 설정 가능하게 뺌).
+    mandatory_sl_min_tier: int = 4
 
     state: EngineState = field(default=EngineState.IDLE)
     filled_step_count: int = 0
@@ -151,7 +155,7 @@ class GridEngine:
 
         if not self.manual_mode:
             await self._reregister_tp(row)
-            if row.major_tier >= MANDATORY_SL_MIN_TIER:
+            if row.major_tier >= self.mandatory_sl_min_tier:
                 await self._reregister_sl(row)
 
         if self.filled_step_count >= len(self.grid_rows):
@@ -254,7 +258,7 @@ class GridEngine:
         self.open_qty -= close_qty
 
         await self._reregister_tp(row)
-        if row.major_tier >= MANDATORY_SL_MIN_TIER:
+        if row.major_tier >= self.mandatory_sl_min_tier:
             await self._reregister_sl(row)
         return True
 

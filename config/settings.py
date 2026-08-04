@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     leverage: Decimal = Decimal("20")
     grid_tick: Decimal = Decimal("50")
     max_stage: int = 3
+    # 4~5차 진입 시 거래소 SL 필수 등록(SPEC 원안, 100단계/5-tier 풀 구조 기준 확정값).
+    # max_stage를 3으로 낮춰 쓰면(예: 제까깟-마틴게이-3k.xlsx 3-tier 압축 설계) major_tier가
+    # 4에 절대 도달하지 못해 이 기본값 그대로면 SL이 영원히 등록되지 않는다 — 2026-08-04
+    # 사용자 확인 하에 3-tier 운용에서는 .env에서 3으로 낮춰 쓴다(xlsx의 "3차 필수 SL" 규칙).
+    mandatory_sl_min_tier: int = 4
     daily_loss_limit_pct: Optional[Decimal] = None
     cooldown_minutes: int = 30
     max_open_grid_orders: int = 5

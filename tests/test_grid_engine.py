@@ -128,6 +128,30 @@ async def test_on_fill_tier4_registers_sl():
 
 
 @pytest.mark.asyncio
+async def test_on_fill_respects_custom_mandatory_sl_min_tier():
+    # 2026-08-04: max_stage=3(3-tier 압축 설계, 제까깟-마틴게이-3k.xlsx 기준)으로 운용하면
+    # major_tier가 4에 절대 도달하지 못해 기본값(4)으로는 SL이 영원히 등록되지 않는다 —
+    # mandatory_sl_min_tier를 3으로 낮춰서 tier3에서 SL이 등록되는지 확인한다.
+    adapter = make_adapter()
+    rows = make_grid_rows()
+    engine = GridEngine(
+        adapter=adapter, instrument=INSTRUMENT, direction="long", grid_rows=rows,
+        max_open_grid_orders=5, mandatory_sl_min_tier=3,
+    )
+    await engine.start_laddering()
+
+    await fill_grid_index(adapter, engine, rows, 0)
+    assert engine.sl_order_id is None  # tier1
+    await fill_grid_index(adapter, engine, rows, 1)
+    assert engine.sl_order_id is None  # tier2
+    await fill_grid_index(adapter, engine, rows, 2)
+    assert engine.sl_order_id is not None  # tier3 — 기본값(4)이었으면 여기서 등록 안 됐어야 함
+    open_orders = await adapter.get_open_orders(INSTRUMENT)
+    stop_order = next(o for o in open_orders if o.order_id == engine.sl_order_id)
+    assert stop_order.status == "open"
+
+
+@pytest.mark.asyncio
 async def test_reregister_cancels_previous_tp_before_placing_new_one():
     adapter = make_adapter()
     rows = make_grid_rows()

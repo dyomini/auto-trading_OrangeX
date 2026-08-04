@@ -119,6 +119,24 @@ async def build_grid_rows(
     ticker = await market_data_adapter.get_ticker(settings.symbol)
     weights = load_weights()
     tick_multiplier = await _compute_atr_tick_multiplier(settings, binance_http_client)
+
+    # 2026-08-04, "3k" 참고 스프레드시트(제까깟-마틴게이-3k.xlsx) 검증 결과 반영: max_stage
+    # 절삭은 compute_grid() *이전에* weights 리스트 자체를 잘라서 넘긴다. compute_grid()의
+    # weight_sum이 넘겨받은 weights 전체 합이라, 예전처럼 100개를 다 넘기고 결과 행만 잘라내면
+    # 실제로 쓰이지도 않는 뒤쪽 tier들의 비중까지 분모에 남아 equity의 상당 부분이 어느
+    # 단계에도 배정되지 않고 남아돌았다(MAX_STAGE=3 기준 약 79% 미배정, xlsx로 교차검증).
+    # weights 자체를 잘라 넘기면 그 안에서 비중이 재정규화돼, 활성 tier들에 equity 전액이
+    # 실제로 배정된다.
+    max_stage_step_count = min(settings.max_stage * STEPS_PER_TIER, len(weights))
+    if max_stage_step_count < len(weights):
+        logger.info(
+            "사용자가 설정한 max_stage=%d 단계로 격자 절삭(%d단계 → %d단계, SPEC 최대 단계 제한 "
+            "— max_feasible_step과 별개로 사용자가 정한 상한). 비중도 이 %d단계 기준으로 "
+            "재정규화됨(3k 참고 설계와 동일).",
+            settings.max_stage, len(weights), max_stage_step_count, max_stage_step_count,
+        )
+        weights = weights[:max_stage_step_count]
+
     rows = compute_grid(
         direction=settings.direction,
         base_price=ticker.last_price,
@@ -129,15 +147,6 @@ async def build_grid_rows(
         maint_margin_rate=settings.maint_margin_rate,
         sl_pct=settings.sl_pct,
     )
-
-    max_stage_step_count = settings.max_stage * STEPS_PER_TIER
-    if len(rows) > max_stage_step_count:
-        logger.info(
-            "사용자가 설정한 max_stage=%d 단계로 격자 절삭(%d단계 → %d단계, SPEC 최대 단계 제한 "
-            "— max_feasible_step과 별개로 사용자가 정한 상한)",
-            settings.max_stage, len(rows), max_stage_step_count,
-        )
-        rows = rows[:max_stage_step_count]
 
     feasibility = find_max_feasible_step(rows)
     if not feasibility.all_feasible:

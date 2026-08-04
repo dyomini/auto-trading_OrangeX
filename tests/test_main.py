@@ -332,10 +332,13 @@ async def test_run_both_directions_wires_up_independent_long_and_short_engines(t
         assert long_engine.grid_rows[1].entry_price < long_engine.grid_rows[0].entry_price
         assert short_engine.grid_rows[1].entry_price > short_engine.grid_rows[0].entry_price
 
-        # 전체 자금(20000)이 반씩(10000씩) 분배됐는지 — equity=10000 기준 1단계 증거금은
-        # 다른 테스트들(예: tests/test_grid_engine.py)에서도 확인된 값인 5.8이어야 한다.
-        assert long_engine.grid_rows[0].cum_margin == Decimal("5.8")
-        assert short_engine.grid_rows[0].cum_margin == Decimal("5.8")
+        # 전체 자금(20000)이 반씩(10000씩) 분배됐는지 — equity=10000, max_stage=3(기본값)
+        # 기준 1단계 증거금은 60단계(3-tier) 가중치 합(3530)으로 재정규화된 값인 28.3이어야
+        # 한다(2026-08-04, weight_sum 재정규화 수정 전에는 100단계 전체 합(17130) 기준
+        # 5.8이었음 — max_stage로 안 쓰는 tier4/5 가중치가 분모에 남아 equity 대부분이
+        # 미배정으로 낭비되던 값).
+        assert long_engine.grid_rows[0].cum_margin == Decimal("28.3")
+        assert short_engine.grid_rows[0].cum_margin == Decimal("28.3")
 
         # 서로 다른 PaperAdapter(독립된 자금/포지션)를 쓰고 있어야 함.
         assert long_engine.adapter is not short_engine.adapter

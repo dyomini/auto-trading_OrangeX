@@ -36,7 +36,6 @@ from typing import Optional
 from engine.grid_engine import (
     HYBRID_RESET_FRACTION,
     HYBRID_RESET_MIN_TIER,
-    MANDATORY_SL_MIN_TIER,
     EngineState,
     GridEngine,
 )
@@ -87,6 +86,7 @@ async def reconstruct_state(
     grid_rows: list[GridStepResult],
     direction: Direction,
     manual_mode: bool = False,
+    mandatory_sl_min_tier: int = 4,
 ) -> RecoveredState:
     position = await adapter.get_position(instrument)
     open_orders = await adapter.get_open_orders(instrument)
@@ -179,10 +179,10 @@ async def reconstruct_state(
         # 신뢰한다. hybrid_reset/SL 자동화 자체가 꺼져 있어 아래 값은 쓰이지 않는다.
         hybrid_reset_done = False
     else:
-        sl_required = row.major_tier >= MANDATORY_SL_MIN_TIER
+        sl_required = row.major_tier >= mandatory_sl_min_tier
         if sl_required and sl_order_id is None:
             raise RestartRecoveryError(
-                f"tier {row.major_tier}(>= {MANDATORY_SL_MIN_TIER})인데 미체결 SL 주문이 없음 — SPEC상 필수"
+                f"tier {row.major_tier}(>= {mandatory_sl_min_tier})인데 미체결 SL 주문이 없음 — SPEC상 필수"
             )
         if not sl_required and sl_order_id is not None:
             raise RestartRecoveryError(f"tier {row.major_tier}인데 SL 주문이 존재함 — 예상 밖 상태")
@@ -222,9 +222,13 @@ async def build_recovered_engine(
     grid_rows: list[GridStepResult],
     max_open_grid_orders: int = 5,
     manual_mode: bool = False,
+    mandatory_sl_min_tier: int = 4,
 ) -> GridEngine:
     """`reconstruct_state()`로 재구성한 값을 실제로 사용 가능한 `GridEngine`에 채워 넣는다."""
-    recovered = await reconstruct_state(adapter, instrument, grid_rows, direction, manual_mode=manual_mode)
+    recovered = await reconstruct_state(
+        adapter, instrument, grid_rows, direction,
+        manual_mode=manual_mode, mandatory_sl_min_tier=mandatory_sl_min_tier,
+    )
     engine = GridEngine(
         adapter=adapter,
         instrument=instrument,
@@ -232,6 +236,7 @@ async def build_recovered_engine(
         grid_rows=grid_rows,
         max_open_grid_orders=max_open_grid_orders,
         manual_mode=manual_mode,
+        mandatory_sl_min_tier=mandatory_sl_min_tier,
     )
     engine.state = recovered.state
     engine.filled_step_count = recovered.filled_step_count
