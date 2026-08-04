@@ -185,10 +185,13 @@ def _ask_amount(prompt: str, default: Decimal) -> Decimal:
 
 def _run_quick_entry() -> None:
     from config.settings import Settings
-    from quick_entry import QuickEntryError, compute_chunk_count
+    from quick_entry import QuickEntryError, compute_chunk_count, compute_preview_rows
 
     print("\n[즉시 진입] 현재가부터 지정가 매수/매도 주문을 한 번에 여러 개 걸어놓습니다.")
-    print(" 진입만 자동으로 걸립니다 — 익절/손절/청산은 반드시 거래소에서 직접 관리하세요.\n")
+    print(" 진입만 자동으로 걸립니다 — 익절/손절/청산은 반드시 거래소에서 직접 관리하세요.")
+    print(" 증거금은 균등 분배가 아니라 config/weights.csv 비중대로(마틴게일 설계 그대로)")
+    print(" EQUITY_USDT 전액을 배분합니다 — 한 번 실행할 때마다 이 방향에 배정된 자금이")
+    print(" 전부 소진됩니다.\n")
 
     direction_choice = _ask_choice(
         "방향을 선택하세요.",
@@ -212,12 +215,15 @@ def _run_quick_entry() -> None:
     settings_preview = Settings()
     try:
         num_chunks = compute_chunk_count(settings_preview, price_range_usdt)
+        preview_rows = compute_preview_rows(settings_preview, num_chunks)
     except QuickEntryError as e:
         print(f"\n실행하지 못했습니다: {e}")
         return
-    total_margin = settings_preview.quick_entry_chunk_usdt * num_chunks
+    total_margin = sum(row.step_margin for row in preview_rows)
+    first_margin = preview_rows[0].step_margin
+    last_margin = preview_rows[-1].step_margin
     print(
-        f"\n-> 주문 {num_chunks}개, 개당 증거금 {settings_preview.quick_entry_chunk_usdt} USDT "
+        f"\n-> 주문 {num_chunks}개, 단계당 증거금 {first_margin} ~ {last_margin} USDT "
         f"(총 증거금 {total_margin} USDT, 레버리지 {settings_preview.leverage}x)"
     )
 

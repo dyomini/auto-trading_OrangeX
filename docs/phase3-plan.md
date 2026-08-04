@@ -199,6 +199,29 @@ SPEC.md Phase 3는 원래 "체결마다 TP 취소 후 재등록"과 "4~5차 진�
   게이트는 의도적으로 건드리지 않음(Enter 연타로 실수 확정되는 걸 막는 안전장치라 메뉴
   선택으로 바꾸지 않는 게 맞다고 판단).
 
+- **완료(2026-08-05)**: 즉시 진입 증거금 배분을 균등에서 weights.csv 비중 기반으로 재정정
+  — 사용자 정정: "진입 마진은 항상 50usdt가 아니야. 엑셀에 기재된 비중대로 진입 마진 설계."
+  `quick_entry.py`의 `run_quick_entry()`가 이제 `strategy.weights.load_weights()`로 실제
+  엑셀 비중을 가져와 `settings.equity_usdt` 전액을 배분한다(균등 청크 대신 메인 격자
+  엔진과 완전히 동일한 마진 배분 로직) — `settings.quick_entry_chunk_usdt` 필드는 제거.
+  - **주문 개수(price_range_usdt // grid_tick, 위 항목에서 정정된 설계)는 그대로 유지**하되,
+    `weights.csv`를 그 개수만큼 슬라이스해서(`max_stage` 절삭과 동일한 재정규화 원리,
+    engine/grid_setup.py 참고) 넘긴다 — **한 번 즉시 진입을 실행할 때마다 그 방향에 배정된
+    EQUITY_USDT 전액이 소진되고, 가격 범위가 좁을수록(단계 수가 적을수록) 단계당 증거금은
+    오히려 커진다.**
+  - `compute_preview_rows()` 신규 — 실행 확인 전 마진 미리보기용. margin은 가격과 무관하게
+    weight/equity 비율로만 정해지므로, 실제 현재가 조회 없이(오프라인) 더미 base_price로
+    `compute_grid()`를 호출해도 `step_margin`만큼은 실행 시와 정확히 동일하다(entry_price/
+    step_qty 등 가격 의존 필드는 이 미리보기에서 버려짐). `launcher.py`의 미리보기 출력을
+    `단계당 증거금 O ~ O USDT (총 증거금 O USDT)`로 변경.
+  - `config/settings.py`/`.env.example`/`README.md`에서 `QUICK_ENTRY_CHUNK_USDT` 제거.
+  - **테스트**: `tests/test_quick_entry.py` 재작성 — weights.csv 앞 5개 값(10,11,12,13,14)과
+    equity=10000/leverage=20으로 손계산한 값(1666.7/1833.3/2000.0/2166.7/2333.3, 합계
+    정확히 10000.0)을 회귀 기준으로 사용. 청크 개수가 달라져도 총 증거금은 항상
+    equity_usdt 전액이라는 불변식 테스트 추가. 전체 스위트 183개 → **182개**(테스트
+    통합으로 순감소, 실질 커버리지는 늘어남 — 균등분배 전제였던 낡은 assertion들을
+    weights.csv 기반 assertion으로 교체).
+
 ## 아직 만들지 않은 것 (다음 작업)
 - **최소 주문 미달 단계 병합 로직 실제 구현**: 정책은 이미 결정됐음(docs/phase1-report.md: 다음 단계에 합산). 병합하려면 `compute_grid()`의 누적 계산(cum_qty/avg_price/liq_price/TP/SL이 전부 이전 단계에 순차적으로 의존)을 병합 인식형으로 다시 짜야 하는데, 이건 골든 테스트(`tests/test_golden.py`, 엑셀 원본 대조)가 지키는 핵심 재무 계산이라 서둘러 손대면 실제 계산 오류를 만들 위험이 크다. default 설정에서는 이 상황 자체가 발생 안 함을 확인했고 지금은 안전하게 시작을 거부만 하므로, 실제로 이 상황이 발생하는 설정을 쓰게 될 때 제대로 다시 설계해서 구현하는 게 낫다고 판단해 미룸.
 - **`engine/restart_recovery.py`를 OrangeX 라이브로 실제 기동해서 끝까지 검증**: `get_open_orders()` 블로커는 풀렸지만, 이 모듈이 라이브 데이터로 실제로 상태를 정확히 재구성하는지는 아직 실전 확인 전.

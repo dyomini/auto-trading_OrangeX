@@ -2,8 +2,13 @@
 
 price_range_usdt는 증거금 총액이 아니라 현재가 기준 ±가격 범위다(2026-08-05 사용자
 정정 — "3k/5k는 마진 금액이 아니라 현재가 기준 +-(롱/숏) 가격 범위"). 주문 개수는
-price_range_usdt // grid_tick으로 정해지고, 주문 1개당 증거금은 quick_entry_chunk_usdt로
-가격 범위와 무관하게 고정이다.
+price_range_usdt // grid_tick으로 정해진다.
+
+증거금은 균등 분배가 아니라 config/weights.csv 비중대로 equity_usdt 전액을 배분한다
+(2026-08-05 사용자 재정정 — "진입 마진은 항상 50usdt가 아니야. 엑셀에 기재된 비중대로
+진입 마진 설계"). weights.csv의 앞 5개 값(10,11,12,13,14)과 equity_usdt=10000,
+leverage=20 기준으로 손계산한 값(1666.7/1833.3/2000.0/2166.7/2333.3, 합계 10000.0
+정확히 일치)을 그대로 회귀 기준으로 쓴다.
 """
 from __future__ import annotations
 
@@ -14,7 +19,7 @@ import pytest
 from config.settings import Settings
 from exchange.base import ContractSpec
 from exchange.paper import PaperAdapter
-from quick_entry import QuickEntryError, compute_chunk_count, run_quick_entry
+from quick_entry import QuickEntryError, compute_chunk_count, compute_preview_rows, run_quick_entry
 
 INSTRUMENT = "BTC-USDT-PERPETUAL"
 
@@ -26,7 +31,6 @@ def make_settings(**overrides) -> Settings:
         equity_usdt=Decimal("10000"),
         leverage=Decimal("20"),
         grid_tick=Decimal("50"),
-        quick_entry_chunk_usdt=Decimal("50"),
     )
     defaults.update(overrides)
     return Settings(**defaults)
@@ -48,14 +52,29 @@ async def make_adapter(last_price: str = "64000") -> PaperAdapter:
     return adapter
 
 
-def test_compute_chunk_count_uses_grid_tick_not_chunk_usdt():
-    # grid_tick과 quick_entry_chunk_usdt를 일부러 다르게 둬서 두 값이 섞이지 않는지 확인.
-    settings = make_settings(grid_tick=Decimal("100"), quick_entry_chunk_usdt=Decimal("20"))
-    assert compute_chunk_count(settings, Decimal("3000")) == 30  # 3000/100, 20과 무관
+def test_compute_chunk_count_uses_grid_tick():
+    settings = make_settings(grid_tick=Decimal("100"))
+    assert compute_chunk_count(settings, Decimal("3000")) == 30  # 3000/100
+
+
+def test_compute_preview_rows_follows_weights_csv_proportions():
+    # weights.csv 앞 5개: 10,11,12,13,14 (합계 60). equity=10000, leverage=20으로
+    # 손계산한 값과 정확히 일치해야 한다.
+    settings = make_settings()
+    rows = compute_preview_rows(settings, 5)
+
+    margins = [row.step_margin for row in rows]
+    assert margins == [
+        Decimal("1666.7"), Decimal("1833.3"), Decimal("2000.0"),
+        Decimal("2166.7"), Decimal("2333.3"),
+    ]
+    assert sum(margins) == Decimal("10000.0")  # equity_usdt 전액 소진
+    # 마틴게일 설계: 뒤로 갈수록 증거금이 커져야 한다.
+    assert margins == sorted(margins)
 
 
 @pytest.mark.asyncio
-async def test_short_places_orders_at_increasing_prices():
+async def test_short_places_orders_at_increasing_prices_with_weighted_margin():
     settings = make_settings()
     adapter = await make_adapter("64000")
 
@@ -64,9 +83,16 @@ async def test_short_places_orders_at_increasing_prices():
     assert len(order_ids) == 5  # 250 // grid_tick(50)
     open_orders = await adapter.get_open_orders(INSTRUMENT)
     assert len(open_orders) == 5
-    prices = sorted(o.request.price for o in adapter._open_orders.values())
+    by_price = {o.request.price: o for o in adapter._open_orders.values()}
+    prices = sorted(by_price)
     assert prices == [Decimal("64000"), Decimal("64050"), Decimal("64100"), Decimal("64150"), Decimal("64200")]
     assert all(o.side == "sell" for o in [r.request for r in adapter._open_orders.values()])
+
+    # 가격이 오를수록(진입이 깊어질수록) 증거금도 weights.csv대로 커져야 한다.
+    margins = [by_price[p].request.qty * p / settings.leverage for p in prices]
+    expected = [Decimal("1666.7"), Decimal("1833.3"), Decimal("2000.0"), Decimal("2166.7"), Decimal("2333.3")]
+    for actual, exp in zip(margins, expected):
+        assert abs(actual - exp) < Decimal("0.01")
 
 
 @pytest.mark.asyncio
@@ -83,43 +109,20 @@ async def test_long_places_orders_at_decreasing_prices():
 
 
 @pytest.mark.asyncio
-async def test_chunk_count_independent_of_margin_setting():
-    # price_range/grid_tick만으로 개수가 정해져야 한다 — quick_entry_chunk_usdt를 바꿔도
-    # 개수는 그대로고 청크당 증거금만 바뀌어야 한다(정확히 이전 버그가 섞어 쓰던 지점).
-    settings = make_settings(quick_entry_chunk_usdt=Decimal("999"))
-    adapter = await make_adapter("64000")
-
-    order_ids = await run_quick_entry(settings, "short", Decimal("250"), adapter)
-
-    assert len(order_ids) == 5
-    for internal in adapter._open_orders.values():
-        margin = internal.request.qty * internal.request.price / settings.leverage
-        assert abs(margin - Decimal("999")) < Decimal("0.01")
-
-
-@pytest.mark.asyncio
-async def test_equal_margin_per_chunk():
+async def test_total_margin_equals_equity_regardless_of_chunk_count():
+    # 청크 개수가 달라도(가격 범위가 달라도) 총 증거금은 항상 equity_usdt 전액이어야
+    # 한다 — weights.csv 슬라이스가 재정규화되기 때문(2026-08-04 max_stage 버그 수정과
+    # 동일한 원리, engine/grid_setup.py 참고).
     settings = make_settings()
     adapter = await make_adapter("64000")
 
-    await run_quick_entry(settings, "short", Decimal("200"), adapter)
+    await run_quick_entry(settings, "short", Decimal("100"), adapter)  # 2 chunks
 
-    # 청크당 증거금이 동일해야 한다: qty * price / leverage == quick_entry_chunk_usdt(50)
-    # (compute_grid의 step_qty = margin*leverage/price 나눗셈 왕복 오차가 Decimal
-    # 정밀도 한계에서 미세하게 남을 수 있어 근사 비교한다)
-    for internal in adapter._open_orders.values():
-        margin = internal.request.qty * internal.request.price / settings.leverage
-        assert abs(margin - Decimal("50")) < Decimal("0.0001")
-
-
-@pytest.mark.asyncio
-async def test_remainder_below_tick_size_is_dropped():
-    settings = make_settings()
-    adapter = await make_adapter("64000")
-
-    order_ids = await run_quick_entry(settings, "short", Decimal("120"), adapter)
-
-    assert len(order_ids) == 2  # 120 // grid_tick(50) = 2, 20 USDT 남는 범위는 버림
+    total_margin = sum(
+        internal.request.qty * internal.request.price / settings.leverage
+        for internal in adapter._open_orders.values()
+    )
+    assert abs(total_margin - settings.equity_usdt) < Decimal("0.1")
 
 
 @pytest.mark.asyncio
