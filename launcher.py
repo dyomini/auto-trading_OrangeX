@@ -21,6 +21,13 @@ MANUAL_MODE를 고치지 않고도, 실행할 때마다 물어봐서 그 값을 
 `_run_bot()`/`_run_quick_entry()`의 단계 루프가 이를 잡아 바로 전 단계를 다시
 묻는다. 각 흐름의 첫 단계에서 뒤로가면 최상위 "무엇을 할까요?" 메뉴로 돌아간다
 (`main()`이 잡음).
+
+2026-08-06: 실행 로그를 화면뿐 아니라 `logs/`에 파일로도 남긴다(사용자 요청 —
+"디버깅을 위해서, 앞으로는 실행 창 말고 별도의 로그 파일을 만들어서 실행 로그를
+기록하도록해"). 즉시 진입 실전 실행이 반복적으로 원인 파악이 어렵게 실패해서
+(화면 스크롤이 사라지면 재현 불가) 생긴 요청 — 화면(콘솔)엔 기존처럼 깔끔한
+메시지만 보이지만, 파일에는 DEBUG 레벨로 order_id 등 진단에 필요한 추가 정보까지
+같이 남긴다(`quick_entry.py`의 `logger.debug()` 참고).
 """
 from __future__ import annotations
 
@@ -28,7 +35,9 @@ import asyncio
 import logging
 import os
 import sys
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 
 try:
     import msvcrt
@@ -56,6 +65,37 @@ def _enable_vt_mode() -> None:
         kernel32.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
     except Exception:
         pass
+
+
+def _setup_logging(prefix: str) -> Path:
+    """콘솔에는 기존처럼 메시지만 깔끔하게 찍고, `logs/{prefix}_YYYYMMDD_HHMMSS.log`
+    파일에는 시각/레벨/order_id 등 진단 정보까지 DEBUG 레벨로 같이 남긴다 — 콘솔
+    스크롤이 사라지면 실패 원인을 재구성할 수 없다는 문제(2026-08-06 실전 실행 반복
+    실패로 발견)를 해결하기 위함. 반환값은 로그 파일 경로 — 실행 종료 시 사용자에게
+    보여준다."""
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    log_path = log_dir / f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(logging.Formatter("%(message)s"))
+    root.addHandler(console_handler)
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    root.addHandler(file_handler)
+
+    # httpx/httpcore/asyncio는 DEBUG에서 요청·응답 원문(헤더/바디)까지 전부 찍어
+    # 로그 파일이 순식간에 잡음으로 뒤덮인다 — 진단에 필요한 quick_entry.py/launcher.py
+    # 자체 로그만 DEBUG로 남기고 나머지는 WARNING으로 눌러둔다.
+    for noisy in ("httpx", "httpcore", "asyncio"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+    return log_path
 
 
 def _ask_choice_by_number(prompt: str, options: dict[str, str], default: str) -> str:
@@ -186,17 +226,21 @@ def _run_bot() -> None:
     print(" 끄고 싶으면 이 창에서 Ctrl+C 를 누르세요.")
     print("=" * 50 + "\n")
 
+    log_path = _setup_logging("bot")
+    print(f"(이번 실행 로그: {log_path})\n")
+
     from main import main as run_bot
 
     try:
         run_bot()
     except Exception as e:  # noqa: BLE001 - 사용자에게 원인을 그대로 보여주기 위함
+        logging.getLogger(__name__).exception("봇이 멈췄습니다")
         print("\n" + "!" * 50)
         print(" 문제가 발생해서 봇이 멈췄습니다.")
         print(f" 오류 내용: {e!r}")
         print("!" * 50)
     finally:
-        print("\n프로그램이 종료되었습니다.")
+        print(f"\n프로그램이 종료되었습니다. (로그: {log_path})")
         if trading_mode == "live":
             print("실전 매매 중이었습니다 — 거래소 앱에서 실제 포지션/미체결 주문 상태를 꼭 확인해주세요.")
 
@@ -340,12 +384,8 @@ def _run_quick_entry() -> None:
             print("\n취소되었습니다.")
             return
 
-    print("\n주문을 거는 중입니다...\n")
-    # quick_entry.py가 주문마다 남기는 레버리지/체결가/진입 마진 로그(사용자 요청)가
-    # 화면에 보이도록 로깅을 켠다 — order_id/INFO: 같은 잡음은 안 보이게 메시지만
-    # 그대로 출력하는 포맷을 쓴다(사용자 요청).
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+    log_path = _setup_logging("quick_entry")
+    print(f"\n주문을 거는 중입니다... (이번 실행 로그: {log_path})\n")
 
     async def _go() -> None:
         from engine.grid_setup import build_execution_adapter, build_market_data_adapter
@@ -370,19 +410,24 @@ def _run_quick_entry() -> None:
         try:
             order_ids = await run_quick_entry(settings, direction, price_range_usdt, execution_adapter, contract_spec)
         except QuickEntryError as e:
+            logging.getLogger(__name__).error("즉시 진입 실패: %s", e)
             print(f"\n실행하지 못했습니다: {e}")
             return
+        # order_ids는 콘솔엔 안 보여주고(사용자 요청) 파일 로그에만 DEBUG로 남긴다 —
+        # 나중에 get_order_state(order_id)로 직접 조회해 디버깅할 수 있게.
+        logging.getLogger(__name__).debug("주문 %d개 접수 완료. order_ids=%s", len(order_ids), order_ids)
         print(f"\n주문 {len(order_ids)}개 접수 완료.")
 
     try:
         asyncio.run(_go())
     except Exception as e:  # noqa: BLE001 - 사용자에게 원인을 그대로 보여주기 위함
+        logging.getLogger(__name__).exception("즉시 진입 실행 중 문제 발생")
         print("\n" + "!" * 50)
         print(" 문제가 발생했습니다.")
         print(f" 오류 내용: {e!r}")
         print("!" * 50)
     finally:
-        print("\n프로그램이 종료되었습니다.")
+        print(f"\n프로그램이 종료되었습니다. (로그: {log_path})")
         if trading_mode == "live":
             print("실전 매매였습니다 — 거래소 앱에서 실제 포지션/미체결 주문 상태를 꼭 확인해주세요.")
 

@@ -355,6 +355,51 @@ SPEC.md Phase 3는 원래 "체결마다 TP 취소 후 재등록"과 "4~5차 진�
   - 전체 스위트 185개 통과(신규 함수는 기존 `run_quick_entry()` 통합 테스트로 간접
     커버 — 별도 유닛 테스트는 다음에 추가 가능).
 
+- **완료(2026-08-06)**: 실행 로그를 화면뿐 아니라 파일로도 남기도록 함(사용자 요청 —
+  "디버깅을 위해서, 앞으로는 실행 창 말고 별도의 로그 파일을 만들어서 실행 로그를
+  기록하도록해" — 세 번째 실전 재시도 실패 후, 콘솔 스크롤이 사라져서 원인 재구성이
+  불가능한 문제 때문). `launcher.py`에 `_setup_logging(prefix)` 신규 — 콘솔 핸들러는
+  기존처럼 메시지만(INFO 이상), 파일 핸들러(`logs/{prefix}_YYYYMMDD_HHMMSS.log`)는
+  DEBUG까지 타임스탬프/로거명과 함께 남긴다. `quick_entry.py`가 매 주문마다 `logger.
+  debug()`로 order_id/전체 OrderResult를 파일에만 남기도록 추가(콘솔엔 여전히 안 보임,
+  사용자의 기존 요청 유지) — 다음에 실패하면 `get_order_state(order_id)`로 직접 사후
+  재조회할 수 있다. httpx/httpcore/asyncio의 DEBUG 잡음(원시 HTTP 헤더/바디 덤프)은
+  WARNING으로 눌러서 로그가 순식간에 안 뒤덮이게 함. `_run_bot()`에도 동일하게 적용.
+  `logs/`는 `.gitignore`에 추가(계좌 정보가 담길 수 있어 커밋 대상 아님).
+
+- **완료(2026-08-06, 핵심 발견)**: 세 번의 실전 quick_entry 시도가 전부 원인이 다르게
+  보이며 실패해서(position_side, qty_step, 그리고 이번) 근본적으로 더 의심해보다가
+  발견: **`engine/grid_setup.py`의 `build_execution_adapter()`/`build_market_data_adapter()`
+  (그리고 `main.py`의 `direction="both"` shared_client)가 `OrangeXClient` 생성 시
+  `auth_grant_type`을 한 번도 명시한 적이 없었다** — 기본값이 `"client_signature"`인데,
+  이 서명 기반 인증은 `docs/api-notes.md`(§2, §6 항목9)에 **이 프로젝트 전체에서 단
+  한 번도 안정적으로 성공한 적이 없다고 이미 명확히 문서화돼 있었다**("원인 불명으로
+  항상 실패", WS에서도 동일 재현). 지금까지 라이브로 성공했다고 기록된 모든 주문/조회는
+  전부 `scripts/`의 개별 진단 스크립트가 `auth_grant_type="client_credentials"`를
+  직접 넘겨서 우회한 것이었을 뿐, **`main.py`/`launcher.py`가 실제로 쓰는 운영 경로
+  (`build_execution_adapter`)는 단 한 번도 이 기본값을 고친 적이 없었다** — "`main.py`를
+  `trading_mode=live`로 끝까지 기동해본 적이 없다"는 기존 기록과 정확히 들어맞는다.
+  - 라이브로 직접 재현 확인: `build_execution_adapter()`와 동일한 방식(인자 생략)으로
+    만든 클라이언트는 `/private/get_user_position` 호출 시 `Authentication Failure`
+    (code 10000)로 실패. `auth_grant_type="client_credentials"`를 명시하면 5회 연속
+    전부 성공.
+  - **다만 완전히 앞뒤가 맞지는 않는다**: quick_entry의 실제 실전 실행에서는 매번
+    "주문 N개 접수 완료"까지 정상적으로 보이는 로그가 찍혔다 — 인증이 매번 즉시
+    실패했다면 첫 주문 시도에서 바로 예외가 나서 그 로그 자체가 안 찍혔어야 한다.
+    즉 `client_signature` 인증이 "항상" 실패하는 게 아니라 간헐적으로 성공/실패하는
+    것으로 보이며, 이게 오히려 더 위험하다(예측 불가능한 인증 성공/실패가 실전 자동
+    매매 도중 발생할 수 있다는 뜻). 정확한 간헐성의 원인(서버측 문제/서명 계산 타이밍
+    이슈 등)은 미조사 상태 — 다만 `client_credentials`는 이 프로젝트 전체에서 실패
+    사례가 단 한 건도 없어 고민 없이 이 기본값으로 통일하는 게 맞다고 판단.
+  - **수정**: `engine/grid_setup.py`의 `build_market_data_adapter()`/`build_execution_
+    adapter()`, `main.py`의 `direction="both"` shared_client 생성 3곳 전부에
+    `auth_grant_type="client_credentials"` 명시. 전체 스위트 185개 통과(기존 테스트는
+    모킹된 클라이언트를 직접 주입하므로 이 변경으로 깨지지 않음).
+  - **다음 확인 필요**: 이번에도 실제 주문까지 가는 라이브 재검증은 안 함 — 인증
+    안정성만 확인(5회 연속 성공). 다음 실전 시도 때 이 수정 이후로도 주문이 실제로
+    걸리는지, 그리고 (이제 인증이 안정되면) 앞선 두 수정(position_side, qty_step)이
+    제대로 작동하는지까지 함께 확인 필요.
+
 ## 아직 만들지 않은 것 (다음 작업)
 - **[긴급/안전] `engine/grid_engine.py`에 수량 정밀도(qty_step) 반올림 적용**: quick_entry.py는
   2026-08-06에 고쳤지만(`round_qty_to_step()`, `exchange/base.py`), 메인 자동매매 봇

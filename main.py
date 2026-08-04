@@ -228,9 +228,13 @@ async def run(
     # 그냥 무시한다.
     shared_client: Optional[OrangeXClient] = None
     if settings.trading_mode == "live":
+        # auth_grant_type 명시 필요 — engine/grid_setup.py의 build_execution_adapter()
+        # 모듈 docstring 참고(2026-08-06 실전 사고: 기본값 client_signature는 이 프로젝트
+        # 에서 안정적으로 성공한 적이 없음).
         shared_client = OrangeXClient(
             client_id=settings.api_key.get_secret_value(),
             client_secret=settings.api_secret.get_secret_value(),
+            auth_grant_type="client_credentials",
         )
     long_adapter = build_execution_adapter(long_settings, contract_spec, shared_client=shared_client)
     short_adapter = build_execution_adapter(short_settings, contract_spec, shared_client=shared_client)

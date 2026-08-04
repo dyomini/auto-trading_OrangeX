@@ -177,6 +177,16 @@ async def run_quick_entry(
             client_order_id=f"quick-{direction}-{row.index}-{uuid.uuid4().hex[:8]}",
         )
         result = await adapter.place_limit_order(order)
+        # 콘솔엔 안 보여주고(사용자 요청) 파일 로그에만 DEBUG로 order_id/전체 상태를
+        # 남긴다 — 2026-08-06 실전 사고 때 화면 스크롤이 사라져서 어떤 order_id가
+        # 어떤 상태로 응답했는지 재구성 못 했던 문제(사용자 요청으로 파일 로깅 추가)
+        # 재발 방지용. get_order_state(order_id)로 사후에 직접 재조회할 때 필요하다.
+        logger.debug(
+            "[quick-entry %d/%d] place_limit_order 응답: order_id=%s client_order_id=%s "
+            "status=%s filled_qty=%s avg_fill_price=%s (요청: side=%s price=%s qty=%s)",
+            row.index + 1, num_chunks, result.order_id, result.client_order_id, result.status,
+            result.filled_qty, result.avg_fill_price, side, row.entry_price, qty,
+        )
         if result.status in ("cancelled", "rejected"):
             # 거래소가 접수 직후 곧바로 취소/거부한 경우(예: position_side 불일치로
             # 헤지 모드 계좌에서 자동 취소, error_code 5998) — order_id는 정상적으로

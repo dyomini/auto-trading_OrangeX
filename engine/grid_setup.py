@@ -37,10 +37,13 @@ class StartupError(Exception):
 def build_market_data_adapter(settings: Settings) -> OrangeXAdapter:
     """주문 실행과 무관하게 현재가/계약스펙 조회 전용 — `/public/*`만 호출하므로
     API 키가 비어 있어도(예: paper 모드에서 키를 안 넣은 경우) 동작한다
-    (docs/api-notes.md §6 항목15, OrangeXClient.call(authed=False)는 토큰을 요구하지 않음)."""
+    (docs/api-notes.md §6 항목15, OrangeXClient.call(authed=False)는 토큰을 요구하지 않음).
+    이 어댑터는 공개 엔드포인트만 쓰므로 auth_grant_type이 실제로 안 쓰이지만, 아래
+    build_execution_adapter()와 동일하게 명시해 둔다(일관성 + 향후 실수 방지)."""
     client = OrangeXClient(
         client_id=settings.api_key.get_secret_value(),
         client_secret=settings.api_secret.get_secret_value(),
+        auth_grant_type="client_credentials",
     )
     return OrangeXAdapter(client)
 
@@ -55,11 +58,21 @@ def build_execution_adapter(
     반대로 절대 공유하면 안 된다: `OrangeXWsClient.notifications()`는 단일 소비자용 큐라
     두 FillRouter가 같은 큐를 나눠 가지면 서로의 체결 절반씩을 놓치게 된다 — 그래서
     watch_fills()용 연결은 방향마다 독립적으로 새로 만든다(같은 채널을 중복 구독해도
-    두 연결이 각자 전체 스트림을 온전히 받으므로 문제없음)."""
+    두 연결이 각자 전체 스트림을 온전히 받으므로 문제없음).
+
+    **2026-08-06 실전 사고로 발견**: `OrangeXClient`의 `auth_grant_type` 기본값은
+    `"client_signature"`인데, 이 서명 기반 인증은 이 프로젝트 전체에서 단 한 번도
+    안정적으로 성공한 적이 없다(`docs/api-notes.md` §2/§6 항목9 — "원인 불명으로
+    항상 실패", WS에서도 동일 재현). 지금까지 라이브로 검증됐던 모든 주문/조회는
+    전부 `scripts/`의 개별 진단 스크립트가 `auth_grant_type="client_credentials"`를
+    직접 명시해서 우회한 것이었지, 이 함수(실제 `main.py`/`launcher.py`가 쓰는 운영
+    경로)는 명시한 적이 없었다 — 즉 라이브 자동매매/즉시 진입은 인증이 언제 성공하고
+    실패할지 예측 불가능한 상태로 지금까지 운용됐을 수 있다. 반드시 명시한다."""
     if settings.trading_mode == "live":
         client = shared_client or OrangeXClient(
             client_id=settings.api_key.get_secret_value(),
             client_secret=settings.api_secret.get_secret_value(),
+            auth_grant_type="client_credentials",
         )
         # watch_fills()에 필요 — REST용 OrangeXClient와 별도 연결(exchange/orangex/
         # ws_client.py). 연결/인증/구독 자체는 라이브 확인됨(docs/api-notes.md §6 항목19)

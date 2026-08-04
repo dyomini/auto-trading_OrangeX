@@ -12,5 +12,8 @@ docs/orangex-live-samples.json
 # 로컬 실행 상태 (engine/halt_flag.py) — 계정별 런타임 상태라 커밋 대상 아님
 state/
 
+# 실행 로그 (launcher.py _setup_logging) — 계좌/주문 상세가 담길 수 있어 커밋 대상 아님
+logs/
+
 # Claude Code 로컬 툴 설정 — 이 컴퓨터/세션 전용이라 커밋 대상 아님
 .claude/
