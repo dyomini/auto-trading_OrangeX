@@ -57,6 +57,11 @@ async def _price_watch_loop(
         if isinstance(execution_adapter, PaperAdapter):
             await execution_adapter.on_price_tick(ticker.last_price)
         await engine.maybe_hybrid_reset(ticker.last_price)
+        logger.info(
+            "현재가: %s USDT | 상태: %s | 진행 단계: %d/%d | 보유 수량: %s",
+            ticker.last_price, engine.state.value, engine.filled_step_count,
+            len(engine.grid_rows), engine.open_qty,
+        )
         await asyncio.sleep(settings.price_poll_interval_seconds)
 
 
@@ -152,6 +157,10 @@ async def run(
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
+    # httpx가 API 호출마다 자동으로 찍는 "HTTP Request: ..." 로그는 사용자에게 의미 있는
+    # 정보가 아니라 순수 잡음이라 숨긴다 — 대신 _price_watch_loop가 현재가/상태를 사람이
+    # 읽기 쉬운 형태로 매 폴링마다 찍어준다.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     settings = Settings()
     try:
         asyncio.run(run(settings))
