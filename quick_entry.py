@@ -32,6 +32,7 @@ from __future__ import annotations
 import logging
 import uuid
 from decimal import Decimal
+from typing import Optional
 
 from config.settings import Settings
 from exchange.base import ContractSpec, Direction, ExchangeAdapter, OrderRequest, round_qty_to_step
@@ -63,6 +64,48 @@ def compute_chunk_count(settings: Settings, price_range_usdt: Decimal) -> int:
             f"격자 간격(GRID_TICK={tick} USDT)을 키워주세요"
         )
     return num_chunks
+
+
+def _rounded_qty_or_none(row: GridStepResult, contract_spec: ContractSpec) -> Optional[Decimal]:
+    """row의 수량을 거래소 정밀도(qty_step)로 내림하고, 최소 주문 수량/명목가치를
+    만족하면 그 값을, 아니면 None을 반환한다. run_quick_entry()의 실제 검증과
+    compute_max_feasible_chunk_count()의 사전 판정이 항상 같은 기준을 쓰도록
+    로직을 한 곳에 모아둔다."""
+    qty = round_qty_to_step(row.step_qty, contract_spec.qty_step)
+    if qty < contract_spec.min_qty or qty * row.entry_price < contract_spec.min_notional:
+        return None
+    return qty
+
+
+async def compute_max_feasible_chunk_count(
+    settings: Settings,
+    direction: Direction,
+    adapter: ExchangeAdapter,
+    contract_spec: ContractSpec,
+) -> int:
+    """현재 설정(equity_usdt/leverage)과 실제 현재가 기준으로, 반올림 후에도 모든
+    단계가 최소 주문 수량/명목가치를 만족하는 최대 청크 개수(0..TOTAL_STEPS)를
+    계산한다. launcher.py가 실행 전 "최대 진입 범위" 안내에 쓴다(2026-08-06 사용자
+    요청 — "지금 설정으로 최대 범위가 얼마인지 알려주는 안내도 추가해"). 0이면 지금
+    설정으로는 1단계도 성공 못 함(자금/레버리지 자체가 min_qty 대비 너무 작음)."""
+    ticker = await adapter.get_ticker(settings.symbol)
+    weights_all = load_weights()
+    last_ok = 0
+    for n in range(1, TOTAL_STEPS + 1):
+        rows = compute_grid(
+            direction=direction,
+            base_price=ticker.last_price,
+            tick=settings.grid_tick,
+            weights=weights_all[:n],
+            equity=settings.equity_usdt,
+            leverage=settings.leverage,
+            maint_margin_rate=settings.maint_margin_rate,
+            sl_pct=settings.sl_pct,
+        )
+        if any(_rounded_qty_or_none(row, contract_spec) is None for row in rows):
+            break
+        last_ok = n
+    return last_ok
 
 
 def compute_preview_rows(settings: Settings, num_chunks: int) -> list[GridStepResult]:
@@ -117,11 +160,11 @@ async def run_quick_entry(
     side = "buy" if direction == "long" else "sell"
     order_ids: list[str] = []
     for row in rows:
-        qty = round_qty_to_step(row.step_qty, contract_spec.qty_step)
-        if qty < contract_spec.min_qty or qty * row.entry_price < contract_spec.min_notional:
+        qty = _rounded_qty_or_none(row, contract_spec)
+        if qty is None:
             raise QuickEntryError(
                 f"{row.index + 1}/{num_chunks}번째 단계가 정밀도 반영 후 최소 주문 수량/명목가치에 "
-                f"미달함(qty={qty}, min_qty={contract_spec.min_qty}, min_notional={contract_spec.min_notional}) "
+                f"미달함(min_qty={contract_spec.min_qty}, min_notional={contract_spec.min_notional}) "
                 "— 증거금이 너무 잘게 쪼개졌습니다. 가격 범위를 줄여 단계 수를 줄이거나 EQUITY_USDT/"
                 "레버리지를 늘려보세요. "
                 f"앞서 접수된 {len(order_ids)}개는 이미 걸려있을 수 있으니 거래소에서 확인하세요."

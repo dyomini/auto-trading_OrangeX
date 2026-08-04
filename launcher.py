@@ -276,13 +276,41 @@ def _run_quick_entry() -> None:
                 step = STEP_PREVIEW
 
             elif step == STEP_PREVIEW:
-                settings_preview = base_settings.model_copy(update={"leverage": leverage})
+                settings_preview = base_settings.model_copy(update={"leverage": leverage, "direction": direction})
+                print("\n확인 중...")
+
+                async def _check_feasibility() -> tuple:
+                    from engine.grid_setup import build_market_data_adapter
+                    from quick_entry import compute_max_feasible_chunk_count
+
+                    market_data_adapter = build_market_data_adapter(settings_preview)
+                    contract_spec = await market_data_adapter.get_contract_spec(settings_preview.symbol)
+                    max_chunks = await compute_max_feasible_chunk_count(
+                        settings_preview, direction, market_data_adapter, contract_spec
+                    )
+                    return contract_spec, max_chunks
+
+                contract_spec, max_chunks = asyncio.run(_check_feasibility())
+                max_range = settings_preview.grid_tick * max_chunks
+
                 try:
                     num_chunks = compute_chunk_count(settings_preview, price_range_usdt)
+                    if num_chunks > max_chunks:
+                        # 2026-08-06 사용자 요청 — "지금 설정으로 최대 범위가 얼마인지 알려주는
+                        # 안내도 추가해": 예전엔 이 상황이 실제 주문을 걸다가(실전/연습 모드 확인까지
+                        # 다 거친 뒤) 실패해서야 드러났다 — 미리보기 단계에서 먼저 걸러서 최대
+                        # 범위를 바로 알려준다.
+                        raise QuickEntryError(
+                            f"현재 설정(EQUITY_USDT={settings_preview.equity_usdt}, LEVERAGE="
+                            f"{settings_preview.leverage})으로는 최대 {max_chunks}단계(진입 범위 "
+                            f"{max_range} USDT)까지만 가능합니다 — 선택한 범위({price_range_usdt} USDT)가 "
+                            "너무 큽니다."
+                        )
                     preview_rows = compute_preview_rows(settings_preview, num_chunks)
                 except QuickEntryError as e:
                     print(f"\n실행하지 못했습니다: {e}")
-                    print("진입 범위를 다시 선택해주세요.")
+                    print(f"진입 범위를 {max_range} USDT 이하로 다시 선택해주세요." if max_chunks > 0 else
+                          "지금 설정(EQUITY_USDT/LEVERAGE)으로는 1단계도 불가능합니다 — .env를 조정해주세요.")
                     step = STEP_RANGE
                     continue
                 total_margin = sum(row.step_margin for row in preview_rows)
@@ -292,6 +320,7 @@ def _run_quick_entry() -> None:
                     f"\n-> 주문 {num_chunks}개, 단계당 증거금 {first_margin} ~ {last_margin} USDT "
                     f"(총 증거금 {total_margin} USDT, 레버리지 {settings_preview.leverage}x)"
                 )
+                print(f"   (현재 설정 기준 최대 진입 범위: {max_range} USDT, 최대 {max_chunks}단계)")
                 step = STEP_MODE
 
             elif step == STEP_MODE:
