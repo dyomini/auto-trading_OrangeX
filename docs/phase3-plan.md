@@ -128,6 +128,16 @@ SPEC.md Phase 3는 원래 "체결마다 TP 취소 후 재등록"과 "4~5차 진�
      - 테스트: `tests/test_orangex_adapter.py`에 3개 추가(네트워크 에러 재시도, 5xx 재시도, 4xx는 재시도 없이 즉시 실패).
   - 전체 스위트 156개 → **164개 통과**.
 
+- **완료(2026-08-04)**: `direction="both"`(롱/숏 동시 운용) 추가 — 사용자 요청("direction은 양쪽다, 즉 long, short 둘 다 하는 모드도 추가"). 구현 방식은 하나의 프로세스 안에서 롱/숏 각각 완전히 독립된 `GridEngine`+`FillRouter`+`EntryScheduler`+`CycleManager`+어댑터 스택을 동시에 돌리는 것 — `equity_usdt`를 반씩 자동 분할(사용자 선택).
+  - `config/settings.py`: `direction`에 `"both"` 추가.
+  - `main.py`: 기존 `run()` 본문을 `_run_single_direction()`으로 분리하고, `run()`은 `direction != "both"`면 그대로 한 번 호출, `"both"`면 `Settings.model_copy(update=...)`로 롱용/숏용 사본(각각 `equity_usdt/2`, 독립된 `halt_flag_path` — `_derive_halt_flag_path()`로 `state/halted_long.json`/`state/halted_short.json`처럼 분리)을 만들어 두 스택을 동시에 태스크로 돌린다. 한쪽만 halted여도 다른 쪽은 재시작 가능하도록 halt flag 파일 자체를 분리한 게 핵심 — 공유했다면 한쪽 사고로 멀쩡한 다른 쪽까지 재시작을 못 하게 막았을 것.
+  - **헤지 모드 계좌에서 롱/숏 포지션이 동시에 존재할 때 서로 뒤섞이는 버그를 발견해 같이 고침**: `OrangeXAdapter.get_position()`/`get_open_orders()`가 원래 `position_side` 구분 없이 instrument만 보고 첫 매치(또는 전체)를 반환했다 — 롱 담당 어댑터가 숏 포지션/주문을 자기 것으로 착각할 수 있는 심각한 잠재 버그였다. 두 메서드 다 어댑터 생성 시 받은 `self._position_side`로 필터링하도록 수정(position_side가 없으면 기존 동작 유지, 하위호환). **주의**: `get_open_orders_by_instrument` 응답에도 `position_side` 필드가 있다는 가정은 다른 엔드포인트(`get_order_state` 등)에서 관찰된 스키마로부터 유추한 것이라 이 특정 엔드포인트로는 아직 라이브 재검증 못 함 — live에서 `direction="both"` 처음 켤 때 반드시 확인 필요.
+  - REST 클라이언트(`OrangeXClient`)는 계정 전체 레이트리밋(10 req/s)을 지키려고 롱/숏이 공유(`build_execution_adapter`의 `shared_client` 파라미터 추가)하되, WS 연결(`OrangeXWsClient`)은 `notifications()`가 단일 소비자용 큐라 공유하면 체결 스트림을 반씩 나눠 갖게 되는 문제가 있어 방향마다 독립적으로 새로 만듦(같은 채널을 중복 구독해도 각자 전체 스트림을 받으므로 무해함).
+  - PaperAdapter는 아예 손대지 않음 — 방향마다 완전히 별개의 `PaperAdapter` 인스턴스(자기 몫의 가상 자금/포지션)를 만들면 자연스럽게 격리되므로.
+  - **중요 — 최소 시드 2배 필요**: [[이전 계산]](이 문서보다 대화 기록에만 있음) 기준 단일 방향 최소 시드가 현재가/레버리지에 따라 약 5,400 USDT였는데, `both` 모드는 그 금액을 반으로 나눠 쓰므로 **총 자금이 그 최소값의 약 2배(약 10,800 USDT, 레버리지 20배 기준) 이상은 있어야 양쪽 다 시작 가능**하다. 부족하면 `build_grid_rows()`가 (기존과 동일하게) 최소 주문 미달로 시작을 거부한다 — 실제로 equity_usdt=10000으로 both를 테스트하다 이 상황이 재현되어 확인함.
+  - 테스트: `tests/test_orangex_adapter.py` 3개(헤지모드 position_side 필터링 get_position/get_open_orders, 하위호환), `tests/test_main.py` 3개(`_derive_halt_flag_path`, execution_adapter 사전주입 거부, 롱/숏 독립 엔진 end-to-end 와이어링). 전체 스위트 164개 → **170개 통과**. paper 모드로 실제 시장 데이터 대상 end-to-end 스모크 테스트도 완료(롱/숏 둘 다 LADDERING 도달, `[long]`/`[short]` 태그로 구분된 로그 확인).
+  - **아직 launcher.py 대화형 메뉴에는 방향 선택지가 없음** — 지금은 `.env`의 `DIRECTION=both`로만 켤 수 있다. 필요하면 후속 작업으로 메뉴에 추가 가능.
+
 ## 아직 만들지 않은 것 (다음 작업)
 - **최소 주문 미달 단계 병합 로직 실제 구현**: 정책은 이미 결정됐음(docs/phase1-report.md: 다음 단계에 합산). 병합하려면 `compute_grid()`의 누적 계산(cum_qty/avg_price/liq_price/TP/SL이 전부 이전 단계에 순차적으로 의존)을 병합 인식형으로 다시 짜야 하는데, 이건 골든 테스트(`tests/test_golden.py`, 엑셀 원본 대조)가 지키는 핵심 재무 계산이라 서둘러 손대면 실제 계산 오류를 만들 위험이 크다. default 설정에서는 이 상황 자체가 발생 안 함을 확인했고 지금은 안전하게 시작을 거부만 하므로, 실제로 이 상황이 발생하는 설정을 쓰게 될 때 제대로 다시 설계해서 구현하는 게 낫다고 판단해 미룸.
 - **`engine/restart_recovery.py`를 OrangeX 라이브로 실제 기동해서 끝까지 검증**: `get_open_orders()` 블로커는 풀렸지만, 이 모듈이 라이브 데이터로 실제로 상태를 정확히 재구성하는지는 아직 실전 확인 전.

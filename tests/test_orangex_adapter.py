@@ -183,6 +183,50 @@ async def test_get_position_raises_schema_error_for_unexpected_position_side():
 
 
 @pytest.mark.asyncio
+async def test_get_position_filters_by_own_position_side_in_hedge_mode():
+    """2026-08-04, direction="both"(롱/숏 동시 운용) 지원 — 헤지 모드 계좌는 같은
+    instrument에 LONG/SHORT 포지션이 동시에 존재할 수 있다. 이 어댑터가 담당하는
+    position_side가 아닌 포지션은 절대 자기 것으로 착각하면 안 된다."""
+    client = FakeClient(
+        {
+            "/private/get_user_position": [
+                {"instrument_name": INSTRUMENT, "position_side": "LONG", "size": "0.5", "average_price": "60000"},
+                {"instrument_name": INSTRUMENT, "position_side": "SHORT", "size": "-0.3", "average_price": "65000"},
+            ]
+        }
+    )
+    long_adapter = OrangeXAdapter(client, position_side="long")
+    short_adapter = OrangeXAdapter(client, position_side="short")
+
+    long_position = await long_adapter.get_position(INSTRUMENT)
+    short_position = await short_adapter.get_position(INSTRUMENT)
+
+    assert long_position.direction == "long"
+    assert long_position.qty == Decimal("0.5")
+    assert short_position.direction == "short"
+    assert short_position.qty == Decimal("0.3")
+
+
+@pytest.mark.asyncio
+async def test_get_position_without_position_side_keeps_first_match_behavior():
+    """position_side를 안 받은 어댑터(one-way 모드 등 기존 단일방향 사용)는 기존처럼
+    첫 매치를 그대로 쓴다 — 하위호환성 확인."""
+    client = FakeClient(
+        {
+            "/private/get_user_position": [
+                {"instrument_name": INSTRUMENT, "position_side": "LONG", "size": "0.5", "average_price": "60000"},
+            ]
+        }
+    )
+    adapter = OrangeXAdapter(client)
+
+    position = await adapter.get_position(INSTRUMENT)
+
+    assert position.direction == "long"
+    assert position.qty == Decimal("0.5")
+
+
+@pytest.mark.asyncio
 async def test_get_contract_spec_parses_matching_instrument():
     client = FakeClient(
         {
@@ -620,6 +664,28 @@ async def test_get_open_orders_parses_list():
     method, params, authed = client.calls[0]
     assert method == "/private/get_open_orders_by_instrument"
     assert params == {"instrument_name": INSTRUMENT}
+
+
+@pytest.mark.asyncio
+async def test_get_open_orders_filters_by_own_position_side_in_hedge_mode():
+    """2026-08-04, direction="both" 지원 — 헤지 모드 계좌에서 롱/숏 주문이 섞여서
+    와도 이 어댑터가 담당하는 position_side의 주문만 반환해야 한다."""
+    client = FakeClient(
+        {
+            "/private/get_open_orders_by_instrument": [
+                {"order_id": "long-1", "order_state": "open", "filled_amount": "0", "custom_order_id": "grid-0-aaa", "position_side": "LONG"},
+                {"order_id": "short-1", "order_state": "open", "filled_amount": "0", "custom_order_id": "grid-0-bbb", "position_side": "SHORT"},
+            ]
+        }
+    )
+    long_adapter = OrangeXAdapter(client, position_side="long")
+    short_adapter = OrangeXAdapter(client, position_side="short")
+
+    long_orders = await long_adapter.get_open_orders(INSTRUMENT)
+    short_orders = await short_adapter.get_open_orders(INSTRUMENT)
+
+    assert [o.order_id for o in long_orders] == ["long-1"]
+    assert [o.order_id for o in short_orders] == ["short-1"]
 
 
 @pytest.mark.asyncio

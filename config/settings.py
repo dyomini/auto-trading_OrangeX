@@ -22,7 +22,11 @@ class Settings(BaseSettings):
     # 쓰는 축약형 "BTC-USDT-PERP"이 아니다. strategy/market_data.py의 바이낸스 심볼
     # 매핑 키도 이 표기를 그대로 쓴다.
     symbol: str = "BTC-USDT-PERPETUAL"
-    direction: Literal["long", "short"] = "long"
+    # "both"(2026-08-04 사용자 요청, 롱/숏 동시 운용)면 main.py의 run()이 equity_usdt를
+    # 반씩 나눠(각자 EQUITY_USDT/2) 롱용/숏용 GridEngine 스택을 완전히 독립적으로 하나의
+    # 프로세스 안에서 같이 돌린다 — 서로의 주문/체결/포지션을 절대 침범하지 않는다
+    # (OrangeXAdapter.get_position/get_open_orders의 position_side 필터링, 아래 참고).
+    direction: Literal["long", "short", "both"] = "long"
     equity_usdt: Decimal = Decimal("10000")
     leverage: Decimal = Decimal("20")
     grid_tick: Decimal = Decimal("50")

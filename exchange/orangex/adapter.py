@@ -179,8 +179,16 @@ class OrangeXAdapter(ExchangeAdapter):
             "/private/get_user_position", {"instrument_name": instrument}
         )
         positions = result if isinstance(result, list) else result.get("positions", [])
+        # 헤지 모드 계좌는 같은 instrument에 LONG/SHORT 포지션이 동시에 존재할 수 있다
+        # (direction="both" 지원, 2026-08-04) — 이 어댑터가 생성 시 받은 position_side로
+        # 반드시 내 몫만 골라야 한다. 안 그러면 롱 담당 어댑터가 숏 포지션을 자기 것으로
+        # 착각하는 사고가 날 수 있다. position_side가 없으면(one-way 모드 등) 기존처럼
+        # 첫 매치를 그대로 쓴다.
+        expected_side = _DIRECTION_TO_POSITION_SIDE.get(self._position_side) if self._position_side else None
         for pos in positions:
             if pos.get("instrument_name") != instrument:
+                continue
+            if expected_side is not None and pos.get("position_side") != expected_side:
                 continue
             try:
                 side_raw = pos["position_side"]
@@ -362,6 +370,16 @@ class OrangeXAdapter(ExchangeAdapter):
             "/private/get_open_orders_by_instrument", {"instrument_name": instrument}
         )
         orders = result if isinstance(result, list) else result.get("orders", [])
+        # get_position()과 동일한 이유(2026-08-04, direction="both" 지원) — 헤지 모드
+        # 계좌에서는 이 instrument에 롱/숏 양쪽 주문이 섞여서 온다. 이 어댑터가 담당하는
+        # position_side가 아닌 주문은 애초에 내 것이 아니므로 걸러낸다. **주의**: 다른
+        # 엔드포인트(get_order_state 등)에서 position_side 필드가 확인된 것과 달리, 이
+        # get_open_orders_by_instrument 응답에도 동일한 필드가 있는지는 아직 라이브로
+        # 별도 검증하지 못했다 — 같은 주문 객체 스키마를 공유할 것으로 추정한 것(합리적
+        # 추정이지만 SPEC 0번 원칙상 라이브 재검증 필요, docs/phase3-plan.md 참고).
+        expected_side = _DIRECTION_TO_POSITION_SIDE.get(self._position_side) if self._position_side else None
+        if expected_side is not None:
+            orders = [o for o in orders if o.get("position_side") == expected_side]
         return [self._parse_order_result(o, o.get("custom_order_id", "")) for o in orders]
 
     def watch_fills(self, instrument: str) -> AsyncIterator[Fill]:

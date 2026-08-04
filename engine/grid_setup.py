@@ -45,9 +45,19 @@ def build_market_data_adapter(settings: Settings) -> OrangeXAdapter:
     return OrangeXAdapter(client)
 
 
-def build_execution_adapter(settings: Settings, contract_spec: ContractSpec) -> ExchangeAdapter:
+def build_execution_adapter(
+    settings: Settings, contract_spec: ContractSpec, shared_client: Optional[OrangeXClient] = None
+) -> ExchangeAdapter:
+    """`shared_client`는 direction="both"(2026-08-04, 롱/숏 동시 운용) 지원용 — 롱/숏
+    두 어댑터가 REST 호출을 각자 별도의 `OrangeXClient`로 하면 클라이언트별 레이트리밋
+    스로틀이 독립적으로 도는 바람에 계정 전체 한도(10 req/s, docs/api-notes.md §6 항목6)를
+    합쳐서 넘길 수 있다 — 그래서 REST 클라이언트는 반드시 공유해야 한다. WS 클라이언트는
+    반대로 절대 공유하면 안 된다: `OrangeXWsClient.notifications()`는 단일 소비자용 큐라
+    두 FillRouter가 같은 큐를 나눠 가지면 서로의 체결 절반씩을 놓치게 된다 — 그래서
+    watch_fills()용 연결은 방향마다 독립적으로 새로 만든다(같은 채널을 중복 구독해도
+    두 연결이 각자 전체 스트림을 온전히 받으므로 문제없음)."""
     if settings.trading_mode == "live":
-        client = OrangeXClient(
+        client = shared_client or OrangeXClient(
             client_id=settings.api_key.get_secret_value(),
             client_secret=settings.api_secret.get_secret_value(),
         )

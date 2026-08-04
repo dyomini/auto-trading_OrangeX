@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from decimal import Decimal
+from pathlib import Path
 
 import httpx
 import pytest
@@ -21,7 +22,7 @@ from engine.halt_flag import HaltedFlagPresentError, write_halt_flag
 from exchange.base import OrderRequest, StopOrderRequest
 from exchange.orangex.adapter import OrangeXAdapter
 from exchange.paper import PaperAdapter
-from main import run
+from main import _derive_halt_flag_path, run
 
 INSTRUMENT = "BTC-USDT-PERPETUAL"
 
@@ -265,3 +266,84 @@ async def test_run_writes_halt_flag_when_engine_halts_via_fill_router(tmp_path):
     assert flag_path.exists()
     saved = flag_path.read_text(encoding="utf-8")
     assert "SL" in saved or "정지" in saved or "halted" in saved.lower()
+
+
+def test_derive_halt_flag_path_appends_direction_to_stem():
+    assert _derive_halt_flag_path("state/halted.json", "long") == str(Path("state/halted_long.json"))
+    assert _derive_halt_flag_path("state/halted.json", "short") == str(Path("state/halted_short.json"))
+
+
+@pytest.mark.asyncio
+async def test_run_both_rejects_preinjected_execution_adapter():
+    settings = make_settings(direction="both")
+    market_data_adapter = make_market_data_adapter(last_price="64000")
+    fake_adapter = PaperAdapter(
+        instrument=INSTRUMENT,
+        contract_spec=await market_data_adapter.get_contract_spec(INSTRUMENT),
+        initial_equity=Decimal("10000"), leverage=Decimal("20"),
+        maker_fee=Decimal("0.0002"), taker_fee=Decimal("0.0006"),
+    )
+
+    with pytest.raises(ValueError, match="both"):
+        await run(settings, market_data_adapter=market_data_adapter, execution_adapter=fake_adapter)
+
+
+@pytest.mark.asyncio
+async def test_run_both_directions_wires_up_independent_long_and_short_engines(tmp_path):
+    """direction="both"가 실제로 롱/숏 완전히 독립된 두 엔진을 동시에 LADDERING까지
+    도달시키는지 end-to-end로 확인한다. RSI 조건은 롱(<=30)/숏(>=70)이 동시에 참일 수
+    없으므로 manual_mode로 RSI 필터 자체를 건너뛰게 해서 둘 다 결정론적으로 LADDERING에
+    도달하게 만든다."""
+    # equity_usdt=20000 -> 방향당 10000(다른 테스트들의 기본 equity와 동일) — 정확히
+    # 반씩 나뉘고도 최소 주문 수량을 넉넉히 통과하도록.
+    settings = make_settings(
+        direction="both", manual_mode=True, equity_usdt=Decimal("20000"),
+        halt_flag_path=str(tmp_path / "halted.json"),
+    )
+    market_data_adapter = make_market_data_adapter(last_price="64000")
+
+    def binance_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_binance_klines_response("long"))
+
+    binance_client = httpx.AsyncClient(transport=httpx.MockTransport(binance_handler))
+
+    ready_engines = []
+    task = asyncio.create_task(
+        run(
+            settings,
+            market_data_adapter=market_data_adapter,
+            binance_http_client=binance_client,
+            on_engine_ready=ready_engines.append,
+        )
+    )
+    try:
+        for _ in range(500):
+            if len(ready_engines) >= 2 and all(e.state == EngineState.LADDERING for e in ready_engines):
+                break
+            await asyncio.sleep(0)
+        assert len(ready_engines) == 2
+        directions = {e.direction for e in ready_engines}
+        assert directions == {"long", "short"}
+
+        long_engine = next(e for e in ready_engines if e.direction == "long")
+        short_engine = next(e for e in ready_engines if e.direction == "short")
+
+        # 롱은 시작가보다 낮게, 숏은 시작가보다 높게 격자가 잡혀야 함(정반대 방향).
+        assert long_engine.grid_rows[1].entry_price < long_engine.grid_rows[0].entry_price
+        assert short_engine.grid_rows[1].entry_price > short_engine.grid_rows[0].entry_price
+
+        # 전체 자금(20000)이 반씩(10000씩) 분배됐는지 — equity=10000 기준 1단계 증거금은
+        # 다른 테스트들(예: tests/test_grid_engine.py)에서도 확인된 값인 5.8이어야 한다.
+        assert long_engine.grid_rows[0].cum_margin == Decimal("5.8")
+        assert short_engine.grid_rows[0].cum_margin == Decimal("5.8")
+
+        # 서로 다른 PaperAdapter(독립된 자금/포지션)를 쓰고 있어야 함.
+        assert long_engine.adapter is not short_engine.adapter
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await binance_client.aclose()
+
+    # halted 플래그도 방향별로 분리된 경로를 쓰므로 원래 경로 자체는 생성되지 않아야 함.
+    assert not Path(settings.halt_flag_path).exists()
