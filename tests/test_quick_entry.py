@@ -17,11 +17,37 @@ from decimal import Decimal
 import pytest
 
 from config.settings import Settings
-from exchange.base import ContractSpec
+from exchange.base import ContractSpec, OrderResult
 from exchange.paper import PaperAdapter
 from quick_entry import QuickEntryError, compute_chunk_count, compute_preview_rows, run_quick_entry
 
 INSTRUMENT = "BTC-USDT-PERPETUAL"
+
+
+class _RejectingAdapter(PaperAdapter):
+    """2026-08-05 실전 사고 회귀 테스트용 — 거래소가 주문 접수 직후 곧바로 취소하는
+    상황(예: 헤지 모드 계좌에서 position_side 불일치, error_code 5998)을 재현한다.
+    place_limit_order()는 예외를 던지지 않고 status="cancelled"인 OrderResult를 정상
+    반환한다는 게 핵심 — run_quick_entry()가 이 status를 직접 확인해야만 잡을 수 있다."""
+
+    def __init__(self, *args, reject_from_index: int = 0, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._reject_from_index = reject_from_index
+        self._call_count = 0
+
+    async def place_limit_order(self, order):  # type: ignore[override]
+        result = await super().place_limit_order(order)
+        should_reject = self._call_count >= self._reject_from_index
+        self._call_count += 1
+        if should_reject:
+            # 실제 거래소라면 취소된 주문은 더 이상 미체결 목록에 남지 않는다 — 내부
+            # PaperAdapter 장부에서도 지워서 get_open_orders() 검증이 정확하게 한다.
+            self._open_orders.pop(result.order_id, None)
+            result = OrderResult(
+                order_id=result.order_id, client_order_id=result.client_order_id,
+                status="cancelled", filled_qty=result.filled_qty, avg_fill_price=result.avg_fill_price,
+            )
+        return result
 
 
 def make_settings(**overrides) -> Settings:
@@ -154,3 +180,39 @@ async def test_chunk_count_exactly_100_succeeds():
     order_ids = await run_quick_entry(settings, "short", Decimal("5000"), adapter)
 
     assert len(order_ids) == 100
+
+
+@pytest.mark.asyncio
+async def test_immediately_cancelled_order_raises_instead_of_reporting_success():
+    # 2026-08-05 실전 사고 회귀 테스트: launcher.py가 .env의 DIRECTION으로 어댑터의
+    # position_side를 설정한 채(quick-entry에서 고른 방향과 다를 수 있음) 실전으로
+    # 실행했더니, 헤지 모드 계좌가 주문을 접수 직후 전부 자동 취소했는데도(place_
+    # limit_order 자체는 예외를 안 던짐) 코드가 이를 감지 못하고 "주문 N개 접수
+    # 완료"라고 잘못 보고했다. run_quick_entry()가 각 주문의 status를 직접 확인해서
+    # cancelled/rejected면 즉시 QuickEntryError로 막아야 한다.
+    settings = make_settings()
+    adapter = _RejectingAdapter(
+        instrument=INSTRUMENT, contract_spec=make_spec(), initial_equity=Decimal("10000"),
+        leverage=Decimal("20"), maker_fee=Decimal("0.0002"), taker_fee=Decimal("0.0006"),
+    )
+    await adapter.on_price_tick(Decimal("64000"))
+
+    with pytest.raises(QuickEntryError):
+        await run_quick_entry(settings, "short", Decimal("250"), adapter)
+
+
+@pytest.mark.asyncio
+async def test_partial_rejection_stops_and_raises():
+    settings = make_settings()
+    adapter = _RejectingAdapter(
+        instrument=INSTRUMENT, contract_spec=make_spec(), initial_equity=Decimal("10000"),
+        leverage=Decimal("20"), maker_fee=Decimal("0.0002"), taker_fee=Decimal("0.0006"),
+        reject_from_index=2,
+    )
+    await adapter.on_price_tick(Decimal("64000"))
+
+    with pytest.raises(QuickEntryError):
+        await run_quick_entry(settings, "short", Decimal("250"), adapter)  # 5 chunks, 3rd gets rejected
+
+    open_orders = await adapter.get_open_orders(INSTRUMENT)
+    assert len(open_orders) == 2  # 앞의 2개는 정상 접수됨 — 3번째에서 멈춤

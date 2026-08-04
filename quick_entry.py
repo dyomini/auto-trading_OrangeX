@@ -119,6 +119,17 @@ async def run_quick_entry(
             client_order_id=f"quick-{direction}-{row.index}-{uuid.uuid4().hex[:8]}",
         )
         result = await adapter.place_limit_order(order)
+        if result.status in ("cancelled", "rejected"):
+            # 거래소가 접수 직후 곧바로 취소/거부한 경우(예: position_side 불일치로
+            # 헤지 모드 계좌에서 자동 취소, error_code 5998) — order_id는 정상적으로
+            # 발급됐으니 place_limit_order() 자체는 예외를 던지지 않는다. 여기서 확인
+            # 안 하고 넘어가면 "접수 완료"로 잘못 보고하게 된다(2026-08-05 실전 사고로
+            # 발견 — 실제로는 주문이 하나도 안 걸렸는데 성공했다고 표시됨).
+            raise QuickEntryError(
+                f"{row.index + 1}/{num_chunks}번째 주문이 거래소에서 즉시 {result.status} "
+                f"처리됨(order_id={result.order_id}) — position_side/증거금 등을 확인하세요. "
+                f"앞서 접수된 {len(order_ids)}개는 이미 걸려있을 수 있으니 거래소에서 확인하세요."
+            )
         order_ids.append(result.order_id)
         logger.info(
             "[quick-entry %d/%d] %s %s @ %s USDT | 레버리지 %sx | 진입 마진 %s USDT",

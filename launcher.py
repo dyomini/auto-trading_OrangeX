@@ -323,7 +323,12 @@ def _run_quick_entry() -> None:
         from exchange.paper import PaperAdapter
         from quick_entry import run_quick_entry
 
-        settings = base_settings.model_copy(update={"leverage": leverage})
+        # direction은 반드시 이 실행에서 사용자가 고른 값으로 덮어써야 한다 — 안 그러면
+        # build_execution_adapter()가 .env의 DIRECTION으로 OrangeXAdapter의 position_side를
+        # 잘못 설정해, 헤지 모드 계좌에서 주문이 거래소에 의해 즉시 자동 취소되는데도
+        # 코드는 이를 감지 못하고 "접수 완료"로 잘못 보고할 수 있다(2026-08-05 실전
+        # 사고로 발견 — .env DIRECTION=long인 채로 "숏"을 선택해서 실행했었음).
+        settings = base_settings.model_copy(update={"leverage": leverage, "direction": direction})
         market_data_adapter = build_market_data_adapter(settings)
         contract_spec = await market_data_adapter.get_contract_spec(settings.symbol)
         execution_adapter = build_execution_adapter(settings, contract_spec)

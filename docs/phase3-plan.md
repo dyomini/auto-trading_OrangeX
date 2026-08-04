@@ -259,6 +259,41 @@ SPEC.md Phase 3는 원래 "체결마다 TP 취소 후 재등록"과 "4~5차 진�
     72단계까지만 사용`으로 이전 관측값(60단계)과 달라진 것으로 보아 완전히 모킹되지
     않은 라이브 시세 의존성이 있는 것으로 추정).
 
+- **완료(2026-08-05, 실전 사고 수정)**: 즉시 진입을 실전으로 실행했는데 화면엔 "주문
+  N개 접수 완료"가 떴지만 거래소 확인 결과 아무 주문도 안 걸려있었던 사고 수정.
+  읽기전용으로 실제 계좌를 조회해 세션 시작 때와 포지션/미체결 주문이 완전히
+  동일함을 확인 — 즉 새 주문이 하나도 안 걸린 게 맞았고, 부분 체결 등 위험한
+  중간 상태는 아니었다.
+  - **근본 원인 2가지**:
+    1. `launcher.py`의 `_go()`가 `build_execution_adapter()`에 넘기는 `settings`를
+       `leverage`만 오버라이드하고 `direction`은 그대로 뒀다 — `OrangeXAdapter`의
+       `position_side`가 `.env`의 `DIRECTION`(당시 `long`)으로 설정된 채, 사용자가
+       즉시 진입에서 고른 방향(`short`)의 매도 주문을 걸었다. 헤지 모드 계좌에서
+       `position_side` 불일치는 주문을 접수 직후 거래소가 자동 취소한다(기존에
+       이미 문서화된 error_code 5998 패턴, `exchange/orangex/adapter.py` 모듈
+       docstring 참고) — `direction="both"` 지원 시 이미 겪었던 문제인데, 이번엔
+       quick_entry라는 새 경로에서 `.env`의 DIRECTION과 실행 시 선택한 방향이
+       달라질 수 있다는 걸 놓쳤다.
+    2. `run_quick_entry()`가 `place_limit_order()`의 반환값(`OrderResult.status`)을
+       전혀 확인하지 않았다 — 거래소가 즉시 취소해도 `place_limit_order()` 자체는
+       예외를 던지지 않고 `status="cancelled"`인 정상 `OrderResult`를 돌려주는데,
+       `order_ids.append(...)`만 하고 넘어가서 전부 취소됐어도 "접수 완료"로
+       잘못 보고했다.
+    - **paper 모드로는 이 버그를 절대 발견할 수 없었던 이유**: `PaperAdapter`는
+      `position_side` 개념 자체가 없어 이 시나리오를 재현 못 한다 — 이번 세션
+      내내 paper 모드로 아무리 폭넓게 테스트해도 못 잡을 수밖에 없었던 사각지대.
+  - **수정**: `launcher.py`의 `_go()`가 `model_copy(update={"leverage": ..., "direction":
+    direction})`로 `direction`도 함께 오버라이드하도록 수정. `quick_entry.py`의
+    `run_quick_entry()`가 매 주문마다 `result.status`를 확인해 `cancelled`/`rejected`면
+    즉시 `QuickEntryError`를 던지도록 수정(이미 접수된 개수도 메시지에 포함).
+  - **테스트**: `tests/test_quick_entry.py`에 `_RejectingAdapter`(PaperAdapter를 상속해
+    지정한 호출 순번부터 거래소의 즉시 취소를 재현하는 테스트 더블) 신규, 회귀 테스트
+    2개 추가(전체 즉시취소 시 에러, 부분 취소 시 접수된 것까지만 남고 에러). 전체
+    스위트 182개 → **185개 통과**.
+  - **다음 확인 필요**: 코드는 고쳤지만 이 세션에서 실제 라이브로 재검증은 안 함(사용자
+    명시적 요청 있을 때만 라이브 테스트 진행하는 SPEC 0번 원칙) — 다음에 사용자가
+    실전으로 다시 시도할 때 이번엔 거래소에 실제로 주문이 걸리는지 반드시 확인 필요.
+
 ## 아직 만들지 않은 것 (다음 작업)
 - **최소 주문 미달 단계 병합 로직 실제 구현**: 정책은 이미 결정됐음(docs/phase1-report.md: 다음 단계에 합산). 병합하려면 `compute_grid()`의 누적 계산(cum_qty/avg_price/liq_price/TP/SL이 전부 이전 단계에 순차적으로 의존)을 병합 인식형으로 다시 짜야 하는데, 이건 골든 테스트(`tests/test_golden.py`, 엑셀 원본 대조)가 지키는 핵심 재무 계산이라 서둘러 손대면 실제 계산 오류를 만들 위험이 크다. default 설정에서는 이 상황 자체가 발생 안 함을 확인했고 지금은 안전하게 시작을 거부만 하므로, 실제로 이 상황이 발생하는 설정을 쓰게 될 때 제대로 다시 설계해서 구현하는 게 낫다고 판단해 미룸.
 - **`engine/restart_recovery.py`를 OrangeX 라이브로 실제 기동해서 끝까지 검증**: `get_open_orders()` 블로커는 풀렸지만, 이 모듈이 라이브 데이터로 실제로 상태를 정확히 재구성하는지는 아직 실전 확인 전.
