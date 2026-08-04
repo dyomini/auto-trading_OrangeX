@@ -13,6 +13,7 @@ MANUAL_MODE를 고치지 않고도, 실행할 때마다 물어봐서 그 값을 
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from decimal import Decimal, InvalidOperation
 
@@ -109,6 +110,9 @@ def _ask_amount(prompt: str, default: Decimal) -> Decimal:
 
 
 def _run_quick_entry() -> None:
+    from config.settings import Settings
+    from quick_entry import QuickEntryError, compute_chunk_count
+
     print("\n[즉시 진입] 현재가부터 지정가 매수/매도 주문을 한 번에 여러 개 걸어놓습니다.")
     print(" 진입만 자동으로 걸립니다 — 익절/손절/청산은 반드시 거래소에서 직접 관리하세요.\n")
 
@@ -119,17 +123,29 @@ def _run_quick_entry() -> None:
     )
     direction = "short" if direction_choice == "1" else "long"
 
-    amount_choice = _ask_choice(
-        "\n총 진입 금액(증거금 합계, USDT)을 선택하세요.",
+    range_choice = _ask_choice(
+        "\n진입 범위(현재가 기준 ±USDT — 이 범위까지 격자 간격으로 주문을 깝니다)를 선택하세요.",
         {"1": "3,000 USDT", "2": "5,000 USDT", "3": "직접 입력"},
         default="1",
     )
-    if amount_choice == "1":
-        total_usdt = Decimal("3000")
-    elif amount_choice == "2":
-        total_usdt = Decimal("5000")
+    if range_choice == "1":
+        price_range_usdt = Decimal("3000")
+    elif range_choice == "2":
+        price_range_usdt = Decimal("5000")
     else:
-        total_usdt = _ask_amount("총 진입 금액(USDT)을 입력하세요", Decimal("3000"))
+        price_range_usdt = _ask_amount("진입 범위(현재가 기준 ±USDT)를 입력하세요", Decimal("3000"))
+
+    settings_preview = Settings()
+    try:
+        num_chunks = compute_chunk_count(settings_preview, price_range_usdt)
+    except QuickEntryError as e:
+        print(f"\n실행하지 못했습니다: {e}")
+        return
+    total_margin = settings_preview.quick_entry_chunk_usdt * num_chunks
+    print(
+        f"\n-> 주문 {num_chunks}개, 개당 증거금 {settings_preview.quick_entry_chunk_usdt} USDT "
+        f"(총 증거금 {total_margin} USDT, 레버리지 {settings_preview.leverage}x)"
+    )
 
     trading_mode = _configure_mode()
     if not trading_mode:
@@ -137,7 +153,7 @@ def _run_quick_entry() -> None:
 
     if trading_mode == "live":
         print("\n" + "!" * 50)
-        print(f"  경고: {direction} 방향으로 {total_usdt} USDT 증거금만큼 지정가 주문을 실제로 겁니다.")
+        print(f"  경고: {direction} 방향으로 주문 {num_chunks}개(총 증거금 {total_margin} USDT)를 실제로 겁니다.")
         print("!" * 50)
         confirm = input('정말 실행하려면 "실행" 이라고 입력하세요: ').strip()
         if confirm != "실행":
@@ -145,12 +161,15 @@ def _run_quick_entry() -> None:
             return
 
     print("\n주문을 거는 중입니다...\n")
+    # quick_entry.py가 주문마다 남기는 레버리지/체결가/진입 마진 로그(사용자 요청)가
+    # 화면에 실제로 보이려면 로깅을 켜야 한다 — main.py의 main()과 동일한 설정.
+    logging.basicConfig(level=logging.INFO)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     async def _go() -> None:
-        from config.settings import Settings
         from engine.grid_setup import build_execution_adapter, build_market_data_adapter
         from exchange.paper import PaperAdapter
-        from quick_entry import QuickEntryError, run_quick_entry
+        from quick_entry import run_quick_entry
 
         settings = Settings()
         market_data_adapter = build_market_data_adapter(settings)
@@ -163,7 +182,7 @@ def _run_quick_entry() -> None:
             ticker = await market_data_adapter.get_ticker(settings.symbol)
             await execution_adapter.on_price_tick(ticker.last_price)
         try:
-            order_ids = await run_quick_entry(settings, direction, total_usdt, execution_adapter)
+            order_ids = await run_quick_entry(settings, direction, price_range_usdt, execution_adapter)
         except QuickEntryError as e:
             print(f"\n실행하지 못했습니다: {e}")
             return
