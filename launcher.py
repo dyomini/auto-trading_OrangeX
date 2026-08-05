@@ -397,7 +397,19 @@ def _run_quick_entry() -> None:
         # 잘못 설정해, 헤지 모드 계좌에서 주문이 거래소에 의해 즉시 자동 취소되는데도
         # 코드는 이를 감지 못하고 "접수 완료"로 잘못 보고할 수 있다(2026-08-05 실전
         # 사고로 발견 — .env DIRECTION=long인 채로 "숏"을 선택해서 실행했었음).
-        settings = base_settings.model_copy(update={"leverage": leverage, "direction": direction})
+        #
+        # trading_mode도 반드시 덮어써야 한다 — 2026-08-06 실전 사고로 발견한 훨씬 더
+        # 근본적인 버그: base_settings는 _run_quick_entry() 맨 처음(방향/범위/레버리지를
+        # 묻기도 전)에 Settings()로 딱 한 번 읽혀서 고정된다. _configure_mode()가
+        # os.environ["TRADING_MODE"]="live"를 나중에 설정해도 이미 만들어진 base_settings
+        # 객체는 그걸 다시 읽지 않는다 — 이 update에 trading_mode가 빠져 있으면 사용자가
+        # "실전 매매"를 고르고 "실행"을 두 번이나 입력해 확인해도 실제로는 항상 .env의
+        # 원래 값(TRADING_MODE=paper)으로 PaperAdapter가 조용히 실행됐다. order_id가
+        # UUID 형식(PaperAdapter가 uuid4로 생성)으로 찍힌 로그를 보고 발견함 — 실제
+        # OrangeX order_id는 순수 숫자 문자열이라 한눈에 구분됨.
+        settings = base_settings.model_copy(update={
+            "leverage": leverage, "direction": direction, "trading_mode": trading_mode,
+        })
         market_data_adapter = build_market_data_adapter(settings)
         contract_spec = await market_data_adapter.get_contract_spec(settings.symbol)
         execution_adapter = build_execution_adapter(settings, contract_spec)

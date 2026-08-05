@@ -400,6 +400,41 @@ SPEC.md Phase 3는 원래 "체결마다 TP 취소 후 재등록"과 "4~5차 진�
     걸리는지, 그리고 (이제 인증이 안정되면) 앞선 두 수정(position_side, qty_step)이
     제대로 작동하는지까지 함께 확인 필요.
 
+- **완료(2026-08-06, 진짜 근본 원인)**: 위 인증 수정 이후에도 사용자가 정확히 재현
+  가능한 스크립트(방향/범위/레버리지/실전 확인 전체 트랜스크립트)를 그대로 붙여줘서
+  직접 로그 파일을 열어봤더니 **`order_id`가 `d35ee9db-aade-45a6-8a35-445160aa1aaa`
+  같은 UUID 형식이었다 — 이건 `PaperAdapter`가 `uuid.uuid4()`로 만드는 값이다(실제
+  OrangeX order_id는 `25000129058`처럼 순수 숫자 문자열).** 즉 **사용자가 "실전 매매"를
+  선택하고 "실행"이라고 두 번이나 입력해 확인했는데도, 실제로는 매번 `PaperAdapter`로
+  조용히 실행되고 있었다** — 지금까지의 모든 실전 시도가 사실은 단 한 번도 진짜
+  거래소에 닿은 적이 없었다는 뜻이다. position_side 수정도, qty_step 수정도, 인증
+  수정도 전부 정확했지만 전부 무의미했다 — 애초에 라이브 코드 경로 자체가 실행되지
+  않고 있었으니까.
+  - **원인**: `launcher.py`의 `_run_quick_entry()`가 맨 처음(방향/범위/레버리지를
+    묻기도 전)에 `base_settings = Settings()`로 설정을 딱 한 번 읽어서 고정한다.
+    `_configure_mode()`는 한참 뒤(STEP_MODE)에서야 `os.environ["TRADING_MODE"]=
+    "live"`를 설정하는데, 이미 만들어진 `base_settings` 객체는 그 이후 env 변경을
+    다시 읽지 않는다(pydantic 객체는 불변 스냅샷). `_go()`가 실행용 `settings`를
+    만들 때 `base_settings.model_copy(update={"leverage": leverage, "direction":
+    direction})`로 `leverage`/`direction`은 정확히 오버라이드했지만 **`trading_mode`를
+    빠뜨렸다** — 그 결과 `settings.trading_mode`는 항상 `.env`의 원래 값(`paper`)
+    이었고, `build_execution_adapter()`가 `if settings.trading_mode == "live"` 분기를
+    타지 못해 매번 `PaperAdapter`를 반환했다. 화면엔 실전 경고/확인 절차가 전부 정상
+    표시되고 "접수 완료"까지 뜨니 사용자 입장에선 구분할 방법이 없었다.
+  - **수정**: `model_copy(update={...})`에 `"trading_mode": trading_mode`(STEP_MODE에서
+    `_configure_mode()`가 반환한 실제 값)를 추가.
+  - **테스트**: `tests/test_launcher.py` 신규 — `build_execution_adapter`/`run_quick_
+    entry`를 몽키패치해서 실제로 전달되는 `settings.trading_mode`를 캡처, 실전 선택 시
+    `"live"`인지, 연습 선택 시 `"paper"`인지 검증. **수정 전 코드로 되돌려서 이 테스트가
+    실제로 실패하는지도 확인함**(회귀 테스트가 진짜로 이 버그를 잡는지 검증) — 실패
+    확인 후 수정 복원. 전체 스위트 185개 → **187개 통과**.
+  - **왜 이렇게 오래 걸렸는지**: 이 세션의 모든 paper 모드 테스트(23개 조합, 대화형
+    흐름 재현 등)는 전부 이 버그를 원리적으로 발견할 수 없었다 — paper 모드를
+    선택하면 애초에 `PaperAdapter`가 "정답"이라 버그가 안 보인다. 실전 모드를 실제로
+    선택하고 로그의 `order_id` 형식까지 눈으로 대조해야만 잡을 수 있는 종류의 버그였다.
+  - **교훈(다음에도 적용)**: "화면에 성공 메시지가 뜬다"는 라이브 검증의 증거가 될 수
+    없다 — 반드시 거래소 응답의 원본 필드(이번엔 order_id 형식)까지 대조해야 한다.
+
 ## 아직 만들지 않은 것 (다음 작업)
 - **[긴급/안전] `engine/grid_engine.py`에 수량 정밀도(qty_step) 반올림 적용**: quick_entry.py는
   2026-08-06에 고쳤지만(`round_qty_to_step()`, `exchange/base.py`), 메인 자동매매 봇
