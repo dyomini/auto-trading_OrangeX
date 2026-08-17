@@ -8,10 +8,8 @@ build_grid_rows()를 그대로 거치므로(실제 100단계 격자, tests/test_
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
 from decimal import Decimal
 
-import httpx
 import pytest
 
 from config.settings import Settings
@@ -23,26 +21,6 @@ from exchange.paper import PaperAdapter
 from strategy.grid import GridStepResult
 
 INSTRUMENT = "BTC-USDT-PERPETUAL"
-ONE_DAY_MS = 24 * 60 * 60 * 1000
-
-
-def make_flat_binance_client() -> httpx.AsyncClient:
-    """가격 변화가 전혀 없는(true range=0 -> ATR=0) 완결 일봉 응답을 흉내내서
-    ATR 급등 배율이 항상 1(확대 없음)이 되도록 한다 — 이 파일의 테스트들은 tick 값
-    자체가 아니라 COOLDOWN 감지/리셋 오케스트레이션만 검증하므로, ATR 확대가 끼어들어
-    entry_price 등 결과를 예측 불가능하게 만들지 않도록 고정해둔다."""
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    n = 18
-    rows = []
-    for i in range(n):
-        offset = n - 1 - i
-        open_time_ms = now_ms - 3_600_000 - offset * ONE_DAY_MS
-        rows.append([open_time_ms, "64000", "64000", "64000", "64000"])
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json=rows)
-
-    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
 
 class FakeOrangeXClient:
@@ -127,14 +105,12 @@ async def test_start_next_cycle_resets_engine_with_freshly_computed_rows():
     market_data_adapter = make_market_data_adapter(last_price="65000")
     contract_spec = await market_data_adapter.get_contract_spec(INSTRUMENT)
     settings = make_settings()
-    binance_client = make_flat_binance_client()
     manager = CycleManager(
         engine=engine, market_data_adapter=market_data_adapter, contract_spec=contract_spec,
-        settings=settings, binance_http_client=binance_client,
+        settings=settings,
     )
 
     await manager.start_next_cycle()
-    await binance_client.aclose()
 
     assert engine.state == EngineState.IDLE
     assert engine.grid_rows is not old_rows
@@ -154,10 +130,9 @@ async def test_run_detects_cooldown_and_starts_next_cycle_automatically():
     market_data_adapter = make_market_data_adapter()
     contract_spec = await market_data_adapter.get_contract_spec(INSTRUMENT)
     settings = make_settings(cooldown_minutes=0)
-    binance_client = make_flat_binance_client()
     manager = CycleManager(
         engine=engine, market_data_adapter=market_data_adapter, contract_spec=contract_spec,
-        settings=settings, poll_interval_seconds=0, binance_http_client=binance_client,
+        settings=settings, poll_interval_seconds=0,
     )
 
     task = asyncio.create_task(manager.run())
@@ -183,4 +158,3 @@ async def test_run_detects_cooldown_and_starts_next_cycle_automatically():
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        await binance_client.aclose()

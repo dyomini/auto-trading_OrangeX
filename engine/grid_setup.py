@@ -6,13 +6,9 @@
 from __future__ import annotations
 
 import logging
-from decimal import Decimal
 from typing import Optional
 
-import httpx
-
 from config.settings import Settings
-from engine.entry_filter import compute_atr_tick_multiplier
 from exchange.base import ContractSpec, ExchangeAdapter
 from exchange.orangex.adapter import OrangeXAdapter
 from exchange.orangex.client import OrangeXClient
@@ -20,13 +16,9 @@ from exchange.orangex.ws_client import OrangeXWsClient
 from exchange.paper import PaperAdapter
 from strategy.feasibility import find_max_feasible_step, find_min_order_shortfalls
 from strategy.grid import STEPS_PER_TIER, GridStepResult, compute_grid
-from strategy.indicators import compute_atr
-from strategy.market_data import closed_candles, fetch_daily_candles
 from strategy.weights import load_weights
 
 logger = logging.getLogger(__name__)
-
-_ATR_PERIOD = 14
 
 
 class StartupError(Exception):
@@ -92,46 +84,21 @@ def build_execution_adapter(
     )
 
 
-async def _compute_atr_tick_multiplier(
-    settings: Settings, http_client: Optional[httpx.AsyncClient] = None
-) -> Decimal:
-    """ATR 급등 시 격자 간격(tick)을 넓힐 배율을 계산한다 — 판정 기준/배율 자체는
-    `engine/entry_filter.py`의 기본값을 쓴다(SPEC에 값이 없어 이 구현이 정한 것,
-    사용자 요청으로 직접 결정). 완결 일봉이 부족하면 배율 1(확대 없음)을 반환한다."""
-    candles = await fetch_daily_candles(settings.symbol, limit=_ATR_PERIOD + 4, http_client=http_client)
-    closed = closed_candles(candles)
-    if len(closed) < _ATR_PERIOD + 2:  # 오늘/어제 ATR 창을 각각 계산하려면 +2 필요
-        logger.info(
-            "ATR 급등 판정에 필요한 완결 일봉이 부족함(%d개) — 격자 간격 확대 안 함",
-            len(closed),
-        )
-        return Decimal("1")
-
-    atr_today = compute_atr(closed[-(_ATR_PERIOD + 1):], period=_ATR_PERIOD)
-    atr_yesterday = compute_atr(closed[-(_ATR_PERIOD + 2):-1], period=_ATR_PERIOD)
-    multiplier = compute_atr_tick_multiplier(atr_today, atr_yesterday)
-    if multiplier != Decimal("1"):
-        logger.warning(
-            "ATR 급등 감지(오늘 %s / 어제 %s) — 격자 간격을 %s배로 확대",
-            atr_today, atr_yesterday, multiplier,
-        )
-    return multiplier
-
-
 async def build_grid_rows(
     settings: Settings,
     market_data_adapter: OrangeXAdapter,
     contract_spec: ContractSpec,
-    binance_http_client: Optional[httpx.AsyncClient] = None,
 ) -> list[GridStepResult]:
-    """실시간 현재가를 base_price로 잡아 100단계 격자를 계산하고, SPEC이 요구하는
-    사용자 지정 max_stage 절삭(110번) + 실행가능성 절삭(66번) + 최소 주문 미달
-    검증(71번) + ATR 급등 시 격자 간격 확대(90번)까지 적용한다. 사이클마다(최초 기동
-    시에도, `CycleManager`가 COOLDOWN 이후 재호출할 때도) 매번 새로 호출해야 한다 —
-    그 사이 가격/변동성이 움직였으므로 base_price와 tick을 다시 잡아야 하기 때문이다."""
+    """실시간 현재가를 base_price로 잡아 격자를 계산하고, SPEC이 요구하는 사용자 지정
+    max_stage 절삭(110번) + 실행가능성 절삭(66번) + 최소 주문 미달 검증(71번)을
+    적용한다. 사이클마다(최초 기동 시에도, `CycleManager`가 COOLDOWN 이후 재호출할
+    때도) 매번 새로 호출해야 한다 — 그 사이 가격이 움직였으므로 base_price를 다시
+    잡아야 하기 때문이다.
+
+    2026-08-17: SPEC 90번의 "ATR 급등 시 격자 간격 확대"는 사용자 결정으로 제거했다
+    ("진입 근거에서 atr은 배제해"). tick은 이제 항상 `settings.grid_tick` 그대로다."""
     ticker = await market_data_adapter.get_ticker(settings.symbol)
     weights = load_weights()
-    tick_multiplier = await _compute_atr_tick_multiplier(settings, binance_http_client)
 
     # 2026-08-04, "3k" 참고 스프레드시트(제까깟-마틴게이-3k.xlsx) 검증 결과 반영: max_stage
     # 절삭은 compute_grid() *이전에* weights 리스트 자체를 잘라서 넘긴다. compute_grid()의
@@ -153,7 +120,7 @@ async def build_grid_rows(
     rows = compute_grid(
         direction=settings.direction,
         base_price=ticker.last_price,
-        tick=settings.grid_tick * tick_multiplier,
+        tick=settings.grid_tick,
         weights=weights,
         equity=settings.equity_usdt,
         leverage=settings.leverage,

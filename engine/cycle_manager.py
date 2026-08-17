@@ -19,9 +19,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Optional
-
-import httpx
 
 from config.settings import Settings
 from engine.grid_engine import EngineState, GridEngine
@@ -41,7 +38,6 @@ class CycleManager:
     contract_spec: ContractSpec
     settings: Settings
     poll_interval_seconds: int = _DEFAULT_POLL_INTERVAL_SECONDS
-    binance_http_client: Optional[httpx.AsyncClient] = None
 
     async def run(self) -> None:
         """호출부가 태스크로 돌리다가 필요 시 취소(CancelledError)하는 방식을 전제로
@@ -62,7 +58,7 @@ class CycleManager:
         """대기가 끝난 뒤 실제로 다음 사이클을 시작한다. `run()`과 분리해뒀기 때문에
         테스트나 수동 트리거에서 대기 없이 바로 호출할 수도 있다."""
         grid_rows = await build_grid_rows(
-            self.settings, self.market_data_adapter, self.contract_spec, self.binance_http_client
+            self.settings, self.market_data_adapter, self.contract_spec
         )
         self.engine.reset_for_new_cycle(grid_rows)
         logger.info("다음 사이클 시작: base_price=%s", grid_rows[0].entry_price)

@@ -112,7 +112,7 @@ async def _run_single_direction(
 
     if execution_adapter is None:
         execution_adapter = build_execution_adapter(settings, contract_spec)
-    grid_rows = await build_grid_rows(settings, market_data_adapter, contract_spec, binance_http_client)
+    grid_rows = await build_grid_rows(settings, market_data_adapter, contract_spec)
 
     try:
         engine = await build_recovered_engine(
@@ -152,7 +152,6 @@ async def _run_single_direction(
         contract_spec=contract_spec,
         settings=settings,
         poll_interval_seconds=settings.cycle_manager_poll_interval_seconds,
-        binance_http_client=binance_http_client,
     )
 
     tasks = [
