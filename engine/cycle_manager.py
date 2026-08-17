@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from enum import Enum
 
 from config.settings import Settings
 from engine.grid_engine import EngineState, GridEngine
@@ -31,6 +32,24 @@ logger = logging.getLogger(__name__)
 _DEFAULT_POLL_INTERVAL_SECONDS = 10
 
 
+class CycleRestartPolicy(Enum):
+    """COOLDOWN 대기가 끝난 뒤 다음 사이클을 어떻게 시작할지."""
+
+    # 기존 동작(방향 고정): 같은 엔진에 새 grid_rows만 갈아끼우고 제자리에서 재시작.
+    RESET_IN_PLACE = "reset_in_place"
+    # DIRECTION=auto: 방향을 15분봉 RSI로 다시 정해야 하는데, 방향이 바뀌면
+    # OrangeXAdapter의 position_side까지 달라져야 해서 스택을 통째로 다시 만들어야 한다
+    # (헤지 모드에서 position_side가 틀리면 주문이 접수 직후 자동 취소됨, error 5998).
+    # 그래서 여기서는 아무것도 리셋하지 않고 호출부에 재조립을 요청만 한다.
+    REBUILD_STACK = "rebuild_stack"
+
+
+class CycleOutcome(Enum):
+    """`CycleManager.run()`이 정상 반환할 때의 사유."""
+
+    REBUILD_REQUESTED = "rebuild_requested"
+
+
 @dataclass
 class CycleManager:
     engine: GridEngine
@@ -38,16 +57,27 @@ class CycleManager:
     contract_spec: ContractSpec
     settings: Settings
     poll_interval_seconds: int = _DEFAULT_POLL_INTERVAL_SECONDS
+    restart_policy: CycleRestartPolicy = CycleRestartPolicy.RESET_IN_PLACE
 
-    async def run(self) -> None:
-        """호출부가 태스크로 돌리다가 필요 시 취소(CancelledError)하는 방식을 전제로
-        한다. 사이클을 무한히 반복한다: COOLDOWN 진입 대기 -> 대기 -> 새 사이클 시작."""
+    async def run(self) -> CycleOutcome:
+        """호출부가 태스크로 돌리다가 필요 시 취소(CancelledError)하는 방식을 전제로 한다.
+
+        `RESET_IN_PLACE`(기본)면 사이클을 무한히 반복한다(반환하지 않는다):
+        COOLDOWN 진입 대기 -> 대기 -> 새 사이클 시작.
+        `REBUILD_STACK`이면 COOLDOWN 대기까지만 하고 `REBUILD_REQUESTED`를 **반환**한다 —
+        사이클 종료를 예외가 아니라 값으로 알리는 이유는 `launcher.py`의 넓은
+        `except Exception`이 정상 종료를 "봇이 멈췄습니다"로 오표시하는 걸 막기 위해서다.
+        cooldown 대기를 여기(반환 전)서 하는 이유는, 대기 동안에도 현재가 관찰 로그가
+        계속 돌게 하고 방향 재판정이 **대기가 끝난 시점**의 RSI로 이뤄지게 하기 위함이다."""
         while True:
             await self._wait_until_cooldown()
             logger.info(
                 "COOLDOWN 진입 감지 — %d분 대기 후 다음 사이클 시작", self.settings.cooldown_minutes
             )
             await asyncio.sleep(self.settings.cooldown_minutes * 60)
+            if self.restart_policy is CycleRestartPolicy.REBUILD_STACK:
+                logger.info("사이클 종료 — 방향을 다시 판정하기 위해 스택 전체를 재조립한다")
+                return CycleOutcome.REBUILD_REQUESTED
             await self.start_next_cycle()
 
     async def _wait_until_cooldown(self) -> None:

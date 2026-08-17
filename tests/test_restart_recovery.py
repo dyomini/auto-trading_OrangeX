@@ -12,7 +12,12 @@ from decimal import Decimal
 import pytest
 
 from engine.grid_engine import EngineState, GridEngine
-from engine.restart_recovery import RestartRecoveryError, build_recovered_engine, reconstruct_state
+from engine.restart_recovery import (
+    RestartRecoveryError,
+    build_recovered_engine,
+    detect_open_direction,
+    reconstruct_state,
+)
 from exchange.base import ContractSpec, MarketOrderRequest, OrderRequest, StopOrderRequest
 from exchange.paper import PaperAdapter
 from strategy.grid import GridStepResult
@@ -669,3 +674,82 @@ async def test_build_recovered_engine_passes_sl_enabled_to_engine():
     )
 
     assert engine.sl_enabled is False
+
+
+# --------------------------------------------------------------------------
+# detect_open_direction — DIRECTION=auto 재시작 시 직전 방향 판정 (2026-08-17).
+# --------------------------------------------------------------------------
+
+
+class _FakeSideAdapter:
+    """position_side로 태깅된 어댑터를 흉내낸다 — 자기 방향의 포지션/주문만 보인다."""
+
+    def __init__(self, qty: Decimal = Decimal("0"), client_order_ids: tuple[str, ...] = ()) -> None:
+        self._qty = qty
+        self._client_order_ids = client_order_ids
+
+    async def get_position(self, instrument: str):
+        from exchange.base import Position
+        return Position(
+            instrument=instrument,
+            direction="long" if self._qty else None,
+            qty=self._qty,
+            avg_price=Decimal("64000") if self._qty else Decimal("0"),
+        )
+
+    async def get_open_orders(self, instrument: str):
+        from exchange.base import OrderResult
+        return [
+            OrderResult(order_id=f"oid-{i}", client_order_id=coid, status="open",
+                        filled_qty=Decimal("0"), avg_fill_price=None)
+            for i, coid in enumerate(self._client_order_ids)
+        ]
+
+
+@pytest.mark.asyncio
+async def test_detect_open_direction_returns_none_when_both_sides_clean():
+    result = await detect_open_direction(_FakeSideAdapter(), _FakeSideAdapter(), INSTRUMENT)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_detect_open_direction_returns_side_holding_position():
+    result = await detect_open_direction(
+        _FakeSideAdapter(qty=Decimal("0.01")), _FakeSideAdapter(), INSTRUMENT
+    )
+    assert result == "long"
+
+    result = await detect_open_direction(
+        _FakeSideAdapter(), _FakeSideAdapter(qty=Decimal("0.02")), INSTRUMENT
+    )
+    assert result == "short"
+
+
+@pytest.mark.asyncio
+async def test_detect_open_direction_returns_side_with_only_resting_orders():
+    """포지션은 flat인데 진입 지정가만 걸려 있는 상태(첫 체결 전)도 이어받아야 한다."""
+    result = await detect_open_direction(
+        _FakeSideAdapter(client_order_ids=("grid-0-abc123",)), _FakeSideAdapter(), INSTRUMENT
+    )
+    assert result == "long"
+
+
+@pytest.mark.asyncio
+async def test_detect_open_direction_raises_when_both_sides_have_state():
+    with pytest.raises(RestartRecoveryError, match="양쪽"):
+        await detect_open_direction(
+            _FakeSideAdapter(qty=Decimal("0.01")),
+            _FakeSideAdapter(qty=Decimal("0.02")),
+            INSTRUMENT,
+        )
+
+
+@pytest.mark.asyncio
+async def test_detect_open_direction_ignores_foreign_client_order_ids():
+    """봇이 만들지 않은 주문(사용자가 직접 건 것 등)은 흔적으로 치지 않는다."""
+    result = await detect_open_direction(
+        _FakeSideAdapter(client_order_ids=("my-manual-order", "web-ui-12345")),
+        _FakeSideAdapter(),
+        INSTRUMENT,
+    )
+    assert result is None

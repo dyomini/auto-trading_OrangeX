@@ -13,7 +13,7 @@ from decimal import Decimal
 import pytest
 
 from config.settings import Settings
-from engine.cycle_manager import CycleManager
+from engine.cycle_manager import CycleManager, CycleOutcome, CycleRestartPolicy
 from engine.grid_engine import EngineState, GridEngine
 from exchange.base import ContractSpec
 from exchange.orangex.adapter import OrangeXAdapter
@@ -158,3 +158,43 @@ async def test_run_detects_cooldown_and_starts_next_cycle_automatically():
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+@pytest.mark.asyncio
+async def test_run_returns_rebuild_requested_under_rebuild_policy():
+    """REBUILD_STACK이면 제자리 리셋을 하지 않고 호출부에 재조립을 요청만 해야 한다.
+    build_grid_rows를 아예 호출하지 않는다는 걸 확인하려고, 호출되면 터지는
+    market_data_adapter를 준다."""
+    adapter = make_paper_adapter()
+    rows = make_grid_rows()
+    engine = GridEngine(adapter=adapter, instrument=INSTRUMENT, direction="long", grid_rows=rows, max_open_grid_orders=1)
+    await drive_engine_to_cooldown(engine, adapter, rows)
+    assert engine.state == EngineState.COOLDOWN
+
+    class _ExplodingMarketData:
+        async def get_ticker(self, instrument):  # pragma: no cover
+            raise AssertionError("REBUILD_STACK에서는 build_grid_rows가 호출되면 안 됨")
+
+    manager = CycleManager(
+        engine=engine, market_data_adapter=_ExplodingMarketData(),
+        contract_spec=ContractSpec(instrument=INSTRUMENT, tick_size=Decimal("50"), min_qty=Decimal("0.0001"), min_notional=Decimal("10"), contract_size=Decimal("1")), settings=make_settings(cooldown_minutes=0),
+        poll_interval_seconds=0, restart_policy=CycleRestartPolicy.REBUILD_STACK,
+    )
+
+    outcome = await asyncio.wait_for(manager.run(), timeout=5)
+
+    assert outcome is CycleOutcome.REBUILD_REQUESTED
+    assert engine.state == EngineState.COOLDOWN  # 제자리 리셋되지 않았다
+    assert engine.grid_rows is rows
+
+
+@pytest.mark.asyncio
+async def test_default_policy_is_reset_in_place():
+    """회귀 방어: 고정 방향 운용이 실수로 재조립 모드로 바뀌지 않았는지."""
+    manager = CycleManager(
+        engine=GridEngine(adapter=make_paper_adapter(), instrument=INSTRUMENT, direction="long",
+                          grid_rows=make_grid_rows(), max_open_grid_orders=1),
+        market_data_adapter=make_market_data_adapter(), contract_spec=ContractSpec(instrument=INSTRUMENT, tick_size=Decimal("50"), min_qty=Decimal("0.0001"), min_notional=Decimal("10"), contract_size=Decimal("1")),
+        settings=make_settings(),
+    )
+    assert manager.restart_policy is CycleRestartPolicy.RESET_IN_PLACE

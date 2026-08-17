@@ -26,6 +26,21 @@ class StartupError(Exception):
     재시작 상태 불일치 등)에서 발생."""
 
 
+def _require_resolved_direction(settings: Settings) -> str:
+    """격자/어댑터 조립에는 확정된 방향("long"/"short")이 필요하다.
+
+    `"auto"`/`"both"`는 `main.py`가 실제 방향을 정해 `model_copy`로 넘겨야 하는 값이라,
+    여기까지 그대로 흘러들어오면 격자가 반대로 깔리거나(compute_grid) 주문이 조용히
+    자동취소되는(position_side 불일치) 사고가 된다. `compute_grid()`도 결국 ValueError를
+    내지만 그건 한참 뒤라, 조립 입구에서 명확히 막는다."""
+    if settings.direction not in ("long", "short"):
+        raise StartupError(
+            f"격자/어댑터 조립에는 확정된 방향이 필요함 — direction={settings.direction!r}. "
+            'main.py가 실제 방향을 정해 model_copy로 넘겨야 한다.'
+        )
+    return settings.direction
+
+
 def build_market_data_adapter(settings: Settings) -> OrangeXAdapter:
     """주문 실행과 무관하게 현재가/계약스펙 조회 전용 — `/public/*`만 호출하므로
     API 키가 비어 있어도(예: paper 모드에서 키를 안 넣은 경우) 동작한다
@@ -60,6 +75,7 @@ def build_execution_adapter(
     직접 명시해서 우회한 것이었지, 이 함수(실제 `main.py`/`launcher.py`가 쓰는 운영
     경로)는 명시한 적이 없었다 — 즉 라이브 자동매매/즉시 진입은 인증이 언제 성공하고
     실패할지 예측 불가능한 상태로 지금까지 운용됐을 수 있다. 반드시 명시한다."""
+    direction = _require_resolved_direction(settings)
     if settings.trading_mode == "live":
         client = shared_client or OrangeXClient(
             client_id=settings.api_key.get_secret_value(),
@@ -73,7 +89,7 @@ def build_execution_adapter(
             client_id=settings.api_key.get_secret_value(),
             client_secret=settings.api_secret.get_secret_value(),
         )
-        return OrangeXAdapter(client, position_side=settings.direction, ws_client=ws_client)
+        return OrangeXAdapter(client, position_side=direction, ws_client=ws_client)
     return PaperAdapter(
         instrument=settings.symbol,
         contract_spec=contract_spec,
@@ -97,6 +113,7 @@ async def build_grid_rows(
 
     2026-08-17: SPEC 90번의 "ATR 급등 시 격자 간격 확대"는 사용자 결정으로 제거했다
     ("진입 근거에서 atr은 배제해"). tick은 이제 항상 `settings.grid_tick` 그대로다."""
+    direction = _require_resolved_direction(settings)
     ticker = await market_data_adapter.get_ticker(settings.symbol)
     weights = load_weights()
 
@@ -118,7 +135,7 @@ async def build_grid_rows(
         weights = weights[:max_stage_step_count]
 
     rows = compute_grid(
-        direction=settings.direction,
+        direction=direction,
         base_price=ticker.last_price,
         tick=settings.grid_tick,
         weights=weights,

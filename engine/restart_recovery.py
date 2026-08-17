@@ -81,6 +81,55 @@ def _parse_client_order_id(client_order_id: str, manual_mode: bool = False) -> O
     return kind, index
 
 
+async def detect_open_direction(
+    long_adapter: ExchangeAdapter,
+    short_adapter: ExchangeAdapter,
+    instrument: str,
+) -> Optional[Direction]:
+    """`DIRECTION=auto` 재시작 시 "직전 사이클이 어느 방향이었는지"를 **거래소 실제
+    상태만으로** 판정한다. RSI도, 상태 파일도 권위가 아니다.
+
+    두 어댑터는 각각 `position_side=LONG`/`SHORT`로 태깅된 것이어야 한다 — 헤지 모드
+    계좌에서는 같은 instrument에 롱/숏이 동시에 존재할 수 있어서, 태깅 없이 조회하면
+    `get_position()`이 둘 중 하나를 임의로 집어온다(`exchange/orangex/adapter.py`).
+
+    반환:
+      - `None`: 양쪽 다 포지션 0이고 엔진이 만든 미체결 주문도 없음 -> 이어받을 사이클 없음
+      - `"long"`/`"short"`: 정확히 한쪽에만 흔적이 있음 -> 그 방향으로 복구
+
+    포지션이 열려 있는데 RSI로 방향을 다시 정하면 기존 포지션에 반대 격자를 까는
+    셈이라, 여기서 방향이 나오면 호출부는 RSI 재판정을 **건너뛰어야** 한다.
+
+    해석이 갈리는 모든 경우(양쪽 다 흔적이 있음 등)는 `RestartRecoveryError`다 —
+    auto 모드는 한 번에 한 방향만 운용하므로 양쪽에 있다는 건 봇이 만든 상태가 아니다.
+
+    **주의**: `get_open_orders()`의 `position_side` 필터링은 라이브 미검증 추론이다
+    (`exchange/orangex/adapter.py`의 주석 참고). 그래서 이 판정은 라이브 검증된
+    `get_position()`을 1차 근거로 삼고, 주문 조회는 "포지션은 없는데 주문만 남았다"를
+    잡는 보조 신호로만 쓴다 — 즉 더 보수적으로(거부 쪽으로)만 작동한다."""
+    found: list[Direction] = []
+    for direction, adapter in (("long", long_adapter), ("short", short_adapter)):
+        position = await adapter.get_position(instrument)
+        has_position = position.qty != 0
+        engine_orders = [
+            o
+            for o in await adapter.get_open_orders(instrument)
+            if o.status in ("open", "partially_filled")
+            and _parse_client_order_id(o.client_order_id, manual_mode=True) is not None
+        ]
+        if has_position or engine_orders:
+            found.append(direction)  # type: ignore[arg-type]
+
+    if not found:
+        return None
+    if len(found) == 1:
+        return found[0]
+    raise RestartRecoveryError(
+        f"롱/숏 양쪽 모두에 포지션 또는 미체결 주문이 있음({found}) — auto 모드는 한 번에 "
+        "한 방향만 운용하므로 이 봇이 만든 상태가 아니다. 거래소에서 직접 정리한 뒤 재시작해라."
+    )
+
+
 async def reconstruct_state(
     adapter: ExchangeAdapter,
     instrument: str,
