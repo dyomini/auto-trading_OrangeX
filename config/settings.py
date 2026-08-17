@@ -7,8 +7,10 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Literal, Optional
 
-from pydantic import SecretStr, field_validator
+from pydantic import SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from config.presets import GridPresetName, resolve_preset
 
 
 class Settings(BaseSettings):
@@ -30,6 +32,9 @@ class Settings(BaseSettings):
     equity_usdt: Decimal = Decimal("10000")
     leverage: Decimal = Decimal("20")
     grid_tick: Decimal = Decimal("50")
+    # 격자 프리셋(2026-08-17). 지정하면 max_stage/leverage를 config/presets.py의 값으로
+    # **덮어쓴다** — 아래 _apply_grid_preset 참고. None이면 기존처럼 아래 두 값을 그대로 쓴다.
+    grid_preset: Optional[GridPresetName] = None
     max_stage: int = 3
     # 4~5차 진입 시 거래소 SL 필수 등록(SPEC 원안, 100단계/5-tier 풀 구조 기준 확정값).
     # max_stage를 3으로 낮춰 쓰면(예: 제까깟-마틴게이-3k.xlsx 3-tier 압축 설계) major_tier가
@@ -68,3 +73,19 @@ class Settings(BaseSettings):
         if isinstance(v, str) and v.strip() == "":
             return None
         return v
+
+    @model_validator(mode="after")
+    def _apply_grid_preset(self) -> "Settings":
+        """`grid_preset`이 지정되면 `max_stage`/`leverage`를 프리셋 값으로 덮어쓴다.
+
+        여기서 한 번에 해결하는 이유: 두 값을 읽는 곳이 여러 군데
+        (`engine/grid_setup.py`, `main.py`, `quick_entry.py`)라 각자 프리셋을 해석하게
+        하면 언젠가 한 곳이 빠져서 조용히 어긋난다. 설정 객체가 이미 해석된 값을 들고
+        있으면 read site는 프리셋의 존재 자체를 몰라도 된다."""
+        if self.grid_preset is None:
+            return self
+        max_stage, leverage = resolve_preset(self.grid_preset, self.grid_tick)
+        # model_validator(mode="after")에서의 대입은 재검증을 다시 트리거하지 않는다.
+        object.__setattr__(self, "max_stage", max_stage)
+        object.__setattr__(self, "leverage", leverage)
+        return self

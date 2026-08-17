@@ -130,9 +130,17 @@ async def _run_single_direction(
     except RestartRecoveryError as e:
         raise StartupError(f"재시작 복구 실패 — 거래소 상태와 격자 계산이 안 맞음: {e!r}") from e
 
+    if settings.grid_preset is not None:
+        # 프리셋이 .env의 LEVERAGE/MAX_STAGE를 덮어쓰므로(config/settings.py의
+        # _apply_grid_preset) 실제로 무슨 값이 쓰이는지 반드시 눈에 보이게 남긴다.
+        logger.info(
+            "격자 프리셋 %s 적용: max_stage=%d, leverage=%s배 (.env의 LEVERAGE/MAX_STAGE는 무시됨)",
+            settings.grid_preset, settings.max_stage, settings.leverage,
+        )
     logger.info(
-        "봇 기동: mode=%s symbol=%s direction=%s 복구된 state=%s filled_step_count=%d",
-        settings.trading_mode, settings.symbol, settings.direction, engine.state, engine.filled_step_count,
+        "봇 기동: mode=%s symbol=%s direction=%s leverage=%s 복구된 state=%s filled_step_count=%d",
+        settings.trading_mode, settings.symbol, settings.direction, settings.leverage,
+        engine.state, engine.filled_step_count,
     )
     if on_engine_ready is not None:
         on_engine_ready(engine)
