@@ -169,3 +169,36 @@ def test_build_execution_adapter_live_mode_returns_orangex_adapter():
 
     assert isinstance(adapter, OrangeXAdapter)
     assert adapter._ws_client is not None  # watch_fills()가 쓸 WS 클라이언트도 같이 구성됨
+
+
+@pytest.mark.asyncio
+async def test_min_order_shortfall_error_tells_the_required_equity():
+    """"N개 단계 미달"만으로는 얼마를 넣어야 하는지 알 수 없다 — 필요한 최소 시드를
+    같이 알려준다(2026-08-17)."""
+    settings = make_settings(equity_usdt=Decimal("1000"))
+    market_data_adapter = make_market_data_adapter()
+    contract_spec = await market_data_adapter.get_contract_spec(INSTRUMENT)
+
+    with pytest.raises(StartupError, match="EQUITY_USDT가 약"):
+        await build_grid_rows(settings, market_data_adapter, contract_spec)
+
+
+@pytest.mark.asyncio
+async def test_build_grid_rows_rejects_unresolved_direction():
+    settings = make_settings(direction="auto")
+    market_data_adapter = make_market_data_adapter()
+    contract_spec = await market_data_adapter.get_contract_spec(INSTRUMENT)
+
+    with pytest.raises(StartupError, match="확정된 방향"):
+        await build_grid_rows(settings, market_data_adapter, contract_spec)
+
+
+def test_build_execution_adapter_rejects_unresolved_direction():
+    settings = make_settings(direction="both", trading_mode="paper")
+    contract_spec = ContractSpec(
+        instrument=INSTRUMENT, tick_size=Decimal("50"), min_qty=Decimal("0.001"),
+        min_notional=Decimal("10"), contract_size=Decimal("1"),
+    )
+
+    with pytest.raises(StartupError, match="확정된 방향"):
+        build_execution_adapter(settings, contract_spec)

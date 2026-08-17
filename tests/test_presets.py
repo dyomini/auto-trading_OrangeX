@@ -77,3 +77,12 @@ def test_settings_without_preset_keeps_explicit_values():
 def test_settings_with_incompatible_tick_raises():
     with pytest.raises(ValueError):
         Settings(grid_preset="3k", grid_tick=Decimal("70"))
+
+
+def test_empty_grid_preset_env_value_is_treated_as_unset():
+    """.env.example이 `GRID_PRESET=` (빈 값)으로 배포되므로 빈 문자열이 None이어야 한다."""
+    settings = Settings(grid_preset="", leverage=Decimal("20"), max_stage=4, grid_tick=Decimal("50"))
+
+    assert settings.grid_preset is None
+    assert settings.leverage == Decimal("20")
+    assert settings.max_stage == 4

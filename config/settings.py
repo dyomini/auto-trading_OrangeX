@@ -78,7 +78,7 @@ class Settings(BaseSettings):
     # 기본값 False(기존 완전자동 동작 그대로 유지).
     manual_mode: bool = False
 
-    @field_validator("daily_loss_limit_pct", mode="before")
+    @field_validator("daily_loss_limit_pct", "grid_preset", mode="before")
     @classmethod
     def _empty_string_to_none(cls, v: object) -> object:
         if isinstance(v, str) and v.strip() == "":

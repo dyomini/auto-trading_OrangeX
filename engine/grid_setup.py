@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+from decimal import ROUND_CEILING, Decimal
 from typing import Optional
 
 from config.settings import Settings
@@ -162,6 +163,32 @@ async def build_grid_rows(
             f"{len(shortfalls)}개 단계가 최소 주문 수량/명목가치 미달인데 병합 로직이 "
             "아직 구현되지 않았음(docs/phase1-report.md 결정: 다음 단계에 합산 — 정책만 "
             f"확정, 구현은 미완). 첫 미달 단계: index={shortfalls[0].index}, "
-            f"step_qty={shortfalls[0].step_qty}, notional={shortfalls[0].notional}"
+            f"step_qty={shortfalls[0].step_qty}, notional={shortfalls[0].notional}. "
+            + _min_equity_hint(settings, shortfalls, contract_spec)
         )
     return rows
+
+
+def _min_equity_hint(
+    settings: Settings, shortfalls: list, contract_spec: ContractSpec
+) -> str:
+    """"얼마를 넣어야 시작되는지"를 알려준다.
+
+    단계 수량은 equity에 정비례하므로(step_margin = equity * w/Σw, step_qty =
+    step_margin * leverage / price), 가장 크게 모자란 단계의 부족 배율을 현재 equity에
+    곱하면 필요한 최소 자금이 나온다. `step_margin`이 0.1 단위로 quantize되는 탓에
+    정확한 하한은 아니라 **근사치**임을 문구에 명시한다."""
+    ratio = Decimal("1")
+    for s in shortfalls:
+        if s.step_qty > 0 and contract_spec.min_qty > 0:
+            ratio = max(ratio, contract_spec.min_qty / s.step_qty)
+        if s.notional > 0 and contract_spec.min_notional > 0:
+            ratio = max(ratio, contract_spec.min_notional / s.notional)
+    needed = (settings.equity_usdt * ratio).quantize(Decimal("1"), rounding=ROUND_CEILING)
+    preset = f"GRID_PRESET={settings.grid_preset} " if settings.grid_preset else ""
+    doubled = " (DIRECTION=both는 자금을 반씩 나눠 쓰므로 이 값의 2배가 필요하다)"
+    return (
+        f"현재 설정({preset}EQUITY_USDT={settings.equity_usdt}, LEVERAGE={settings.leverage})"
+        f"으로 시작하려면 EQUITY_USDT가 약 {needed} USDT 이상이어야 한다(근사치)."
+        + (doubled if settings.direction == "both" else "")
+    )
