@@ -650,3 +650,73 @@ async def test_manual_mode_hybrid_reset_never_fires():
 
     assert triggered is False
     assert engine.hybrid_reset_done is False
+
+
+# --------------------------------------------------------------------------
+# SL 미등록 (sl_enabled=False) — 2026-08-17 사용자 결정 "sl은 안 걸어도돼".
+# SPEC Phase 3의 "4~5차 SL 필수"에서 의도적으로 벗어난다(docs/phase3-plan.md 기록).
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sl_disabled_skips_registration_even_at_mandatory_tier():
+    adapter = _RecordingAdapter(
+        instrument=INSTRUMENT, contract_spec=make_spec(), initial_equity=Decimal("10000"),
+        leverage=Decimal("20"), maker_fee=Decimal("0.0002"), taker_fee=Decimal("0.0006"),
+    )
+    rows = make_grid_rows()
+    engine = GridEngine(
+        adapter=adapter, instrument=INSTRUMENT, direction="long", grid_rows=rows,
+        max_open_grid_orders=5, sl_enabled=False,
+    )
+    await engine.start_laddering()
+
+    for idx in (0, 1, 2, 3):  # idx3 = major_tier 4 -> 기본값이면 SL이 등록됐어야 함
+        await fill_grid_index(adapter, engine, rows, idx)
+
+    assert engine.sl_order_id is None
+    assert adapter.stop_requests == []
+    assert engine.tp_order_id is not None  # TP는 여전히 정상 재등록된다
+
+
+@pytest.mark.asyncio
+async def test_sl_enabled_by_default_still_registers():
+    """회귀 방어: 기본값(True)에서는 기존 동작 그대로여야 한다."""
+    adapter = _RecordingAdapter(
+        instrument=INSTRUMENT, contract_spec=make_spec(), initial_equity=Decimal("10000"),
+        leverage=Decimal("20"), maker_fee=Decimal("0.0002"), taker_fee=Decimal("0.0006"),
+    )
+    rows = make_grid_rows()
+    engine = GridEngine(
+        adapter=adapter, instrument=INSTRUMENT, direction="long", grid_rows=rows,
+        max_open_grid_orders=5,
+    )
+    await engine.start_laddering()
+    for idx in (0, 1, 2, 3):
+        await fill_grid_index(adapter, engine, rows, idx)
+
+    assert engine.sl_order_id is not None
+    assert len(adapter.stop_requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_sl_disabled_hybrid_reset_still_works_without_sl():
+    """hybrid reset은 SL과 무관하게 그대로 동작해야 한다(유일하게 남은 리스크 완화 장치)."""
+    adapter = _RecordingAdapter(
+        instrument=INSTRUMENT, contract_spec=make_spec(), initial_equity=Decimal("10000"),
+        leverage=Decimal("20"), maker_fee=Decimal("0.0002"), taker_fee=Decimal("0.0006"),
+    )
+    rows = make_grid_rows()
+    engine = GridEngine(
+        adapter=adapter, instrument=INSTRUMENT, direction="long", grid_rows=rows,
+        max_open_grid_orders=5, sl_enabled=False,
+    )
+    await engine.start_laddering()
+    for idx in (0, 1, 2, 3):  # tier4까지 — hybrid reset 대상이면서 SL 대상이기도 한 구간
+        await fill_grid_index(adapter, engine, rows, idx)
+
+    triggered = await engine.maybe_hybrid_reset(rows[3].avg_price)
+
+    assert triggered is True
+    assert engine.sl_order_id is None
+    assert adapter.stop_requests == []

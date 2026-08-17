@@ -88,6 +88,7 @@ async def reconstruct_state(
     direction: Direction,
     manual_mode: bool = False,
     mandatory_sl_min_tier: int = 4,
+    sl_enabled: bool = True,
     contract_spec: Optional[ContractSpec] = None,
 ) -> RecoveredState:
     position = await adapter.get_position(instrument)
@@ -181,13 +182,17 @@ async def reconstruct_state(
         # 신뢰한다. hybrid_reset/SL 자동화 자체가 꺼져 있어 아래 값은 쓰이지 않는다.
         hybrid_reset_done = False
     else:
-        sl_required = row.major_tier >= mandatory_sl_min_tier
-        if sl_required and sl_order_id is None:
-            raise RestartRecoveryError(
-                f"tier {row.major_tier}(>= {mandatory_sl_min_tier})인데 미체결 SL 주문이 없음 — SPEC상 필수"
-            )
-        if not sl_required and sl_order_id is not None:
-            raise RestartRecoveryError(f"tier {row.major_tier}인데 SL 주문이 존재함 — 예상 밖 상태")
+        # sl_enabled=False면 엔진이 애초에 SL을 걸지 않으므로 존재/부재 검증 자체가
+        # 성립하지 않는다(2026-08-17 사용자 결정). GridEngine.sl_enabled와 반드시
+        # 같은 값을 받아야 한다 — 어긋나면 정상 상태를 오류로 막는다.
+        if sl_enabled:
+            sl_required = row.major_tier >= mandatory_sl_min_tier
+            if sl_required and sl_order_id is None:
+                raise RestartRecoveryError(
+                    f"tier {row.major_tier}(>= {mandatory_sl_min_tier})인데 미체결 SL 주문이 없음 — SPEC상 필수"
+                )
+            if not sl_required and sl_order_id is not None:
+                raise RestartRecoveryError(f"tier {row.major_tier}인데 SL 주문이 존재함 — 예상 밖 상태")
 
         # 엔진은 항상 qty_step으로 내린 수량을 주문에 넣으므로, 실제 포지션은 미가공
         # row.cum_qty가 아니라 "내림된 step_qty들의 합"이다. GridEngine과 반드시 동일한
@@ -236,13 +241,14 @@ async def build_recovered_engine(
     max_open_grid_orders: int = 5,
     manual_mode: bool = False,
     mandatory_sl_min_tier: int = 4,
+    sl_enabled: bool = True,
     contract_spec: Optional[ContractSpec] = None,
 ) -> GridEngine:
     """`reconstruct_state()`로 재구성한 값을 실제로 사용 가능한 `GridEngine`에 채워 넣는다."""
     recovered = await reconstruct_state(
         adapter, instrument, grid_rows, direction,
         manual_mode=manual_mode, mandatory_sl_min_tier=mandatory_sl_min_tier,
-        contract_spec=contract_spec,
+        sl_enabled=sl_enabled, contract_spec=contract_spec,
     )
     engine = GridEngine(
         adapter=adapter,
@@ -252,6 +258,7 @@ async def build_recovered_engine(
         max_open_grid_orders=max_open_grid_orders,
         manual_mode=manual_mode,
         mandatory_sl_min_tier=mandatory_sl_min_tier,
+        sl_enabled=sl_enabled,
         contract_spec=contract_spec,
     )
     engine.state = recovered.state

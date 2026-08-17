@@ -111,6 +111,12 @@ class GridEngine:
     # (예: 3-tier 압축 설계) 이 값도 같이 낮춰야 major_tier가 실제로 도달 가능한
     # 값이 된다(2026-08-04, 제까깟-마틴게이-3k.xlsx 검증 후 설정 가능하게 뺌).
     mandatory_sl_min_tier: int = 4
+    # False면 거래소 SL(STOP 주문)을 아예 등록하지 않는다 — SPEC Phase 3의 "4~5차 SL 필수,
+    # 등록 실패 시 전량 청산 후 정지"에서 의도적으로 벗어난 것이다(2026-08-17 사용자 결정
+    # "sl은 안 걸어도돼", docs/phase3-plan.md에 이탈 사유 기록). mandatory_sl_min_tier를
+    # 큰 값으로 우회하는 대신 명시적 플래그를 쓰는 이유: max_stage를 올리면(3k -> 5k
+    # 프리셋) 우회값이 조용히 무력화될 수 있어서다.
+    sl_enabled: bool = True
     # 거래소 수량 정밀도(qty_step)/최소 주문 조건 판정용. None이면 반올림하지 않고
     # 미가공 수량을 그대로 주문에 넣는다(기존 테스트 호출부와 하위호환) — 라이브
     # 운용에서는 반드시 실제 조회한 스펙을 넘겨야 한다(main.py가 배선한다).
@@ -226,7 +232,7 @@ class GridEngine:
 
         if not self.manual_mode:
             await self._reregister_tp(row)
-            if row.major_tier >= self.mandatory_sl_min_tier:
+            if self.sl_enabled and row.major_tier >= self.mandatory_sl_min_tier:
                 await self._reregister_sl(row)
 
         if self.filled_step_count >= len(self.grid_rows):
@@ -334,7 +340,7 @@ class GridEngine:
         self.open_qty -= close_qty
 
         await self._reregister_tp(row)
-        if row.major_tier >= self.mandatory_sl_min_tier:
+        if self.sl_enabled and row.major_tier >= self.mandatory_sl_min_tier:
             await self._reregister_sl(row)
         return True
 

@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     # 4에 절대 도달하지 못해 이 기본값 그대로면 SL이 영원히 등록되지 않는다 — 2026-08-04
     # 사용자 확인 하에 3-tier 운용에서는 .env에서 3으로 낮춰 쓴다(xlsx의 "3차 필수 SL" 규칙).
     mandatory_sl_min_tier: int = 4
+    # False면 거래소 SL(STOP 주문)을 아예 등록하지 않는다 (2026-08-17 사용자 결정).
+    # SPEC Phase 3의 "4~5차 SL 필수"에서 벗어나는 설정이며, 이 경우 격자 최심 주문가와
+    # 청산가 사이의 완충(3k 프리셋 기준 약 2%p)이 유일한 방어선이 된다.
+    sl_enabled: bool = True
     daily_loss_limit_pct: Optional[Decimal] = None
     cooldown_minutes: int = 30
     max_open_grid_orders: int = 5

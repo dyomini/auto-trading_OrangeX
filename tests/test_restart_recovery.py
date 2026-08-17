@@ -619,3 +619,53 @@ async def test_build_recovered_engine_passes_contract_spec_to_engine():
     )
 
     assert engine.contract_spec is spec
+
+
+@pytest.mark.asyncio
+async def test_sl_disabled_recovery_does_not_require_sl_order():
+    """sl_enabled=False로 운용했으면 tier4 이상이어도 SL 주문이 없는 게 정상이다."""
+    adapter = make_adapter()
+    rows = make_grid_rows()
+    old_engine = GridEngine(
+        adapter=adapter, instrument=INSTRUMENT, direction="long", grid_rows=rows,
+        max_open_grid_orders=5, sl_enabled=False,
+    )
+    await old_engine.start_laddering()
+    for idx in (0, 1, 2, 3):  # tier4 — 기본 설정이면 SL이 필수인 구간
+        await fill_grid_index(adapter, old_engine, rows, idx)
+    assert old_engine.sl_order_id is None
+
+    recovered = await reconstruct_state(adapter, INSTRUMENT, rows, "long", sl_enabled=False)
+
+    assert recovered.state == EngineState.LADDERING
+    assert recovered.filled_step_count == 4
+    assert recovered.sl_order_id is None
+
+
+@pytest.mark.asyncio
+async def test_sl_enabled_default_still_requires_sl_order_at_tier4():
+    """회귀 방어: 기본값(True)에서는 기존처럼 SL 부재를 불일치로 막아야 한다."""
+    adapter = make_adapter()
+    rows = make_grid_rows()
+    old_engine = GridEngine(
+        adapter=adapter, instrument=INSTRUMENT, direction="long", grid_rows=rows,
+        max_open_grid_orders=5, sl_enabled=False,
+    )
+    await old_engine.start_laddering()
+    for idx in (0, 1, 2, 3):
+        await fill_grid_index(adapter, old_engine, rows, idx)
+
+    with pytest.raises(RestartRecoveryError, match="SL"):
+        await reconstruct_state(adapter, INSTRUMENT, rows, "long")
+
+
+@pytest.mark.asyncio
+async def test_build_recovered_engine_passes_sl_enabled_to_engine():
+    adapter = make_adapter()
+    rows = make_grid_rows()
+
+    engine = await build_recovered_engine(
+        adapter, INSTRUMENT, "long", rows, max_open_grid_orders=5, sl_enabled=False,
+    )
+
+    assert engine.sl_enabled is False
