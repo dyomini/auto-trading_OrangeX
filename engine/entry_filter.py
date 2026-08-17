@@ -19,6 +19,17 @@ from strategy.liquidation import Direction
 RSI_LONG_ENTRY_THRESHOLD = Decimal("30")
 RSI_SHORT_ENTRY_THRESHOLD = Decimal("70")
 
+# DIRECTION=auto 전용 임계값 (2026-08-17 사용자 결정: "15분 봉 rsi 50 이상이면 숏,
+# rsi 50 이하면 롱"). 위 30/70과 목적이 완전히 다르다 — 이건 "들어갈지 말지"의
+# 게이트가 아니라 "어느 쪽으로 들어갈지"의 선택이다. 50이라 항상 어느 한쪽이 참이며,
+# 그래서 auto 모드에는 "아직 들어가지 마라"는 브레이크가 없다.
+RSI_AUTO_DIRECTION_THRESHOLD = Decimal("50")
+
+
+def direction_from_rsi(rsi: Decimal, threshold: Decimal = RSI_AUTO_DIRECTION_THRESHOLD) -> Direction:
+    """RSI >= threshold면 "short", 미만이면 "long" (경계값은 short 쪽)."""
+    return "short" if rsi >= threshold else "long"
+
 
 def passes_rsi_filter(direction: str, rsi: Decimal) -> bool:
     if direction == "long":

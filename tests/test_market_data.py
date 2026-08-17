@@ -8,9 +8,19 @@ from decimal import Decimal
 import httpx
 import pytest
 
-from strategy.market_data import Candle, UnsupportedInstrumentError, closed_candles, fetch_daily_candles, to_binance_symbol
+from strategy.market_data import (
+    Candle,
+    UnsupportedInstrumentError,
+    UnsupportedIntervalError,
+    closed_candles,
+    fetch_candles,
+    fetch_daily_candles,
+    interval_to_ms,
+    to_binance_symbol,
+)
 
 ONE_DAY_MS = 24 * 60 * 60 * 1000
+D1 = Decimal("1")
 
 RAW_KLINE_ROW = [
     1499040000000,
@@ -94,3 +104,79 @@ def test_closed_candles_keeps_all_when_last_is_fully_elapsed():
 
 def test_closed_candles_handles_empty_list():
     assert closed_candles([]) == []
+
+
+# interval 파라미터화 (2026-08-17) — 15분봉 지원.
+
+
+@pytest.mark.asyncio
+async def test_fetch_candles_sends_requested_interval():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["interval"] = request.url.params["interval"]
+        seen["limit"] = request.url.params["limit"]
+        return httpx.Response(200, json=[[1700000000000, "1", "2", "0.5", "1.5"]])
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    await fetch_candles("BTC-USDT-PERPETUAL", interval="15m", limit=16, http_client=client)
+    await client.aclose()
+
+    assert seen == {"interval": "15m", "limit": "16"}
+
+
+@pytest.mark.asyncio
+async def test_fetch_daily_candles_still_requests_1d():
+    """하위호환 회귀 방어 — 기존 호출부(entry_scheduler)는 여전히 일봉을 받아야 한다."""
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["interval"] = request.url.params["interval"]
+        return httpx.Response(200, json=[[1700000000000, "1", "2", "0.5", "1.5"]])
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    await fetch_daily_candles("BTC-USDT-PERPETUAL", limit=30, http_client=client)
+    await client.aclose()
+
+    assert seen["interval"] == "1d"
+
+
+@pytest.mark.asyncio
+async def test_fetch_candles_rejects_unknown_interval_before_requesting():
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("지원 안 하는 interval인데 요청이 나갔다")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(UnsupportedIntervalError):
+        await fetch_candles("BTC-USDT-PERPETUAL", interval="7m", http_client=client)
+    await client.aclose()
+
+
+def test_interval_to_ms_known_values():
+    assert interval_to_ms("15m") == 15 * 60 * 1000
+    assert interval_to_ms("1d") == 24 * 60 * 60 * 1000
+
+
+def test_closed_candles_drops_forming_15m_candle():
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    candles = [
+        Candle(open_time_ms=now_ms - 30 * 60 * 1000, open=D1, high=D1, low=D1, close=D1),
+        Candle(open_time_ms=now_ms - 60_000, open=D1, high=D1, low=D1, close=D1),  # 진행 중
+    ]
+
+    result = closed_candles(candles, interval_ms=15 * 60 * 1000)
+
+    assert len(result) == 1
+    assert result[0].open_time_ms == now_ms - 30 * 60 * 1000
+
+
+def test_closed_candles_keeps_finished_15m_candle():
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    candles = [
+        Candle(open_time_ms=now_ms - 40 * 60 * 1000, open=D1, high=D1, low=D1, close=D1),
+        Candle(open_time_ms=now_ms - 20 * 60 * 1000, open=D1, high=D1, low=D1, close=D1),  # 이미 마감
+    ]
+
+    result = closed_candles(candles, interval_ms=15 * 60 * 1000)
+
+    assert len(result) == 2
