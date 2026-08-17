@@ -76,6 +76,13 @@ def make_settings(**overrides) -> Settings:
     defaults = dict(
         symbol=INSTRUMENT, direction="long", equity_usdt=Decimal("10000"), leverage=Decimal("20"),
         grid_tick=Decimal("50"), cooldown_minutes=0,
+        # .env가 있는 개발 머신에서 테스트가 그 값에 오염되지 않도록 결과에 영향을
+        # 주는 필드를 전부 명시적으로 고정한다. pydantic-settings는 kwargs로 안 넘긴
+        # 필드를 .env에서 읽어오기 때문에, 예전엔 로컬 .env의 MANUAL_MODE=TRUE가
+        # 흘러들어와 SL 경로 테스트가 조용히 무력화됐다(2026-08-17 발견).
+        manual_mode=False,
+        sl_enabled=True,
+        grid_preset=None,
     )
     defaults.update(overrides)
     return Settings(**defaults)

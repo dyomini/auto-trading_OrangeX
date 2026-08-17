@@ -28,7 +28,10 @@ class Settings(BaseSettings):
     # 반씩 나눠(각자 EQUITY_USDT/2) 롱용/숏용 GridEngine 스택을 완전히 독립적으로 하나의
     # 프로세스 안에서 같이 돌린다 — 서로의 주문/체결/포지션을 절대 침범하지 않는다
     # (OrangeXAdapter.get_position/get_open_orders의 position_side 필터링, 아래 참고).
-    direction: Literal["long", "short", "both"] = "long"
+    # "auto"(2026-08-17 사용자 요청)는 사이클마다 15분봉 RSI(14)로 방향을 다시 정한다
+    # (>=50 숏, <50 롱). equity 분할 없이 전액을 한 방향에 쓰고, 방향이 바뀌면 어댑터
+    # 스택을 통째로 재조립한다(main._run_auto_direction). manual_mode와 병용 불가.
+    direction: Literal["long", "short", "both", "auto"] = "long"
     equity_usdt: Decimal = Decimal("10000")
     leverage: Decimal = Decimal("20")
     grid_tick: Decimal = Decimal("50")

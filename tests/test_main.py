@@ -71,6 +71,13 @@ def make_settings(**overrides) -> Settings:
         leverage=Decimal("20"),
         grid_tick=Decimal("50"),
         max_open_grid_orders=2,
+        # .env가 있는 개발 머신에서 테스트가 그 값에 오염되지 않도록 결과에 영향을
+        # 주는 필드를 전부 명시적으로 고정한다. pydantic-settings는 kwargs로 안 넘긴
+        # 필드를 .env에서 읽어오기 때문에, 예전엔 로컬 .env의 MANUAL_MODE=TRUE가
+        # 흘러들어와 SL 경로 테스트가 조용히 무력화됐다(2026-08-17 발견).
+        manual_mode=False,
+        sl_enabled=True,
+        grid_preset=None,
     )
     defaults.update(overrides)
     return Settings(**defaults)
@@ -350,3 +357,252 @@ async def test_run_both_directions_wires_up_independent_long_and_short_engines(t
 
     # halted 플래그도 방향별로 분리된 경로를 쓰므로 원래 경로 자체는 생성되지 않아야 함.
     assert not Path(settings.halt_flag_path).exists()
+
+
+# --------------------------------------------------------------------------
+# DIRECTION=auto — 사이클마다 15분봉 RSI(14)가 방향을 정한다 (2026-08-17).
+# --------------------------------------------------------------------------
+
+FIFTEEN_MIN_MS = 15 * 60 * 1000
+
+
+def _binance_15m_klines(expect: str) -> list[list]:
+    """마지막 행은 아직 진행 중인 봉이라 closed_candles가 걸러낸다.
+    완결봉 15개가 단조 증가/감소라 RSI가 100/0으로 결정론적으로 나온다."""
+    from datetime import datetime, timezone
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    if expect == "short":
+        closes = [str(60000 + i * 100) for i in range(15)] + ["99999"]
+    else:
+        closes = [str(70000 - i * 100) for i in range(15)] + ["1"]
+    rows = []
+    n = len(closes)
+    for i, close in enumerate(closes):
+        if i == n - 1:
+            open_time_ms = now_ms - 60_000  # 진행 중
+        else:
+            open_time_ms = now_ms - 60_000 - (n - 1 - i) * FIFTEEN_MIN_MS
+        rows.append([open_time_ms, close, close, close, close])
+    return rows
+
+
+def _make_15m_client(expect: str) -> httpx.AsyncClient:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["interval"] == "15m", "auto 모드는 15분봉을 봐야 한다"
+        return httpx.Response(200, json=_binance_15m_klines(expect))
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+async def _run_auto_until_engine(settings, market_data_adapter, client, ready_engines):
+    task = asyncio.create_task(
+        run(
+            settings,
+            market_data_adapter=market_data_adapter,
+            binance_http_client=client,
+            on_engine_ready=ready_engines.append,
+        )
+    )
+    for _ in range(2000):
+        if ready_engines and ready_engines[0].state == EngineState.LADDERING:
+            break
+        await asyncio.sleep(0)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_run_auto_picks_short_when_15m_rsi_at_or_above_50():
+    settings = make_settings(direction="auto")
+    market_data_adapter = make_market_data_adapter(last_price="64000")
+    client = _make_15m_client("short")
+    ready_engines: list = []
+
+    task = await _run_auto_until_engine(settings, market_data_adapter, client, ready_engines)
+    try:
+        assert ready_engines, "엔진이 조립되지 않음"
+        engine = ready_engines[0]
+        assert engine.direction == "short"
+        # 방향이 compute_grid까지 실제로 전달됐는지 격자 기울기로 확인한다 —
+        # 숏이면 진입가가 현재가 위쪽으로 올라간다.
+        assert engine.grid_rows[1].entry_price > engine.grid_rows[0].entry_price
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_run_auto_picks_long_when_15m_rsi_below_50():
+    settings = make_settings(direction="auto")
+    market_data_adapter = make_market_data_adapter(last_price="64000")
+    client = _make_15m_client("long")
+    ready_engines: list = []
+
+    task = await _run_auto_until_engine(settings, market_data_adapter, client, ready_engines)
+    try:
+        assert ready_engines
+        engine = ready_engines[0]
+        assert engine.direction == "long"
+        assert engine.grid_rows[1].entry_price < engine.grid_rows[0].entry_price
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_run_auto_keeps_tp_enabled_and_skips_daily_rsi_gate():
+    """auto는 진입 게이트만 끄고 TP 자동 재등록은 살아 있어야 한다. 일봉(1d) 조회가
+    한 번이라도 나가면 핸들러가 터진다."""
+    settings = make_settings(direction="auto")
+    market_data_adapter = make_market_data_adapter(last_price="64000")
+    client = _make_15m_client("long")
+    ready_engines: list = []
+
+    task = await _run_auto_until_engine(settings, market_data_adapter, client, ready_engines)
+    try:
+        engine = ready_engines[0]
+        assert engine.state == EngineState.LADDERING
+        assert engine.manual_mode is False  # TP/hybrid reset이 켜져 있어야 한다
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_run_auto_rejects_manual_mode():
+    """manual_mode에서는 COOLDOWN에 도달하는 경로가 없어 방향 재판정 시점이 영원히
+    오지 않는다 — 조용히 한 사이클만 돌게 두지 않고 명확히 거부한다."""
+    settings = make_settings(direction="auto", manual_mode=True)
+    market_data_adapter = make_market_data_adapter()
+
+    with pytest.raises(ValueError, match="manual_mode"):
+        await run(settings, market_data_adapter=market_data_adapter)
+
+
+@pytest.mark.asyncio
+async def test_run_auto_rejects_preinjected_execution_adapter():
+    settings = make_settings(direction="auto")
+    market_data_adapter = make_market_data_adapter()
+    contract_spec = await market_data_adapter.get_contract_spec(INSTRUMENT)
+    adapter = PaperAdapter(
+        instrument=INSTRUMENT, contract_spec=contract_spec, initial_equity=Decimal("10000"),
+        leverage=Decimal("20"), maker_fee=Decimal("0.0002"), taker_fee=Decimal("0.0006"),
+    )
+
+    with pytest.raises(ValueError, match="execution_adapter"):
+        await run(settings, market_data_adapter=market_data_adapter, execution_adapter=adapter)
+
+
+@pytest.mark.asyncio
+async def test_run_auto_rebuilds_stack_with_new_direction_after_cycle_completes():
+    """이 파일의 핵심 e2e: 사이클 1(롱)을 실제로 TP까지 체결시켜 COOLDOWN에 넣고,
+    그 사이에 15분봉 RSI를 뒤집어서 사이클 2가 **숏으로, 새 엔진 인스턴스로** 다시
+    조립되는지 확인한다. FIRST_COMPLETED + CycleOutcome 반환 경로 전체를 탄다."""
+    settings = make_settings(
+        direction="auto", cooldown_minutes=0, cycle_manager_poll_interval_seconds=0,
+        price_poll_interval_seconds=0, max_open_grid_orders=1,
+    )
+    market_data_adapter = make_market_data_adapter(last_price="64000")
+    expect = {"value": "long"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["interval"] == "15m"
+        return httpx.Response(200, json=_binance_15m_klines(expect["value"]))
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    ready: list = []
+
+    task = asyncio.create_task(
+        run(settings, market_data_adapter=market_data_adapter,
+            binance_http_client=client, on_engine_ready=ready.append)
+    )
+    try:
+        for _ in range(5000):
+            if ready and ready[0].state == EngineState.LADDERING:
+                break
+            await asyncio.sleep(0)
+        assert ready, "사이클 1 엔진이 조립되지 않음"
+        engine = ready[0]
+        assert engine.direction == "long"
+        adapter = engine.adapter
+
+        # 사이클 1을 실제로 끝낸다. index0의 진입가는 base_price(=현재가)와 같아서
+        # _price_watch_loop의 on_price_tick으로 이미 체결되고 FillRouter가 라우팅한다 —
+        # 그 결과로 TP가 걸릴 때까지 기다렸다가, TP를 체결시켜 COOLDOWN까지 보낸다.
+        for _ in range(5000):
+            if engine.tp_order_id is not None:
+                break
+            await asyncio.sleep(0)
+        assert engine.tp_order_id is not None, "index0 체결이 FillRouter로 라우팅되지 않음"
+
+        tp_price = engine.grid_rows[engine.filled_step_count - 1].target_tp_price
+        await adapter.fill_order(engine.tp_order_id, qty=engine.open_qty, price=tp_price)
+        for _ in range(5000):
+            if engine.state == EngineState.COOLDOWN:
+                break
+            await asyncio.sleep(0)
+        assert engine.state == EngineState.COOLDOWN
+
+        # 다음 사이클은 숏이 나오도록 RSI를 뒤집는다
+        expect["value"] = "short"
+
+        for _ in range(20000):
+            if len(ready) >= 2:
+                break
+            await asyncio.sleep(0)
+
+        assert len(ready) >= 2, "사이클 2 스택이 재조립되지 않음"
+        assert ready[1] is not ready[0], "같은 엔진 인스턴스를 재사용하면 안 된다"
+        assert ready[1].direction == "short"
+        assert ready[1].grid_rows[1].entry_price > ready[1].grid_rows[0].entry_price
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_run_fixed_direction_still_resets_in_place():
+    """회귀 방어: 고정 방향 모드가 실수로 재조립 모드로 바뀌지 않았는지.
+    사이클이 끝나도 엔진 인스턴스는 그대로여야 한다(on_engine_ready 1회만 호출)."""
+    settings = make_settings(
+        direction="long", cooldown_minutes=0, cycle_manager_poll_interval_seconds=0,
+        price_poll_interval_seconds=0, max_open_grid_orders=1, manual_mode=True,
+    )
+    market_data_adapter = make_market_data_adapter(last_price="64000")
+    contract_spec = await market_data_adapter.get_contract_spec(INSTRUMENT)
+    adapter = PaperAdapter(
+        instrument=INSTRUMENT, contract_spec=contract_spec, initial_equity=Decimal("10000"),
+        leverage=Decimal("20"), maker_fee=Decimal("0.0002"), taker_fee=Decimal("0.0006"),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_binance_klines_response("long"))
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    ready: list = []
+
+    task = asyncio.create_task(
+        run(settings, market_data_adapter=market_data_adapter, execution_adapter=adapter,
+            binance_http_client=client, on_engine_ready=ready.append)
+    )
+    try:
+        for _ in range(5000):
+            if ready and ready[0].state == EngineState.LADDERING:
+                break
+            await asyncio.sleep(0)
+        assert len(ready) == 1
+        for _ in range(2000):
+            await asyncio.sleep(0)
+        assert len(ready) == 1, "고정 방향인데 스택이 재조립됐다"
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await client.aclose()

@@ -35,7 +35,8 @@ from typing import Callable, Optional
 import httpx
 
 from config.settings import Settings
-from engine.cycle_manager import CycleManager
+from engine.cycle_manager import CycleManager, CycleOutcome, CycleRestartPolicy
+from engine.direction_selector import decide_direction_with_retry
 from engine.entry_scheduler import EntryMode, EntryScheduler
 from engine.fill_router import FillRouter
 from engine.grid_engine import EngineHaltedError, GridEngine
@@ -46,7 +47,12 @@ from engine.grid_setup import (
     build_market_data_adapter,
 )
 from engine.halt_flag import check_halt_flag, write_halt_flag
-from engine.restart_recovery import RestartRecoveryError, build_recovered_engine
+from engine.restart_recovery import (
+    RestartRecoveryError,
+    build_recovered_engine,
+    detect_open_direction,
+)
+from strategy.liquidation import Direction
 from exchange.base import ContractSpec, ExchangeAdapter
 from exchange.orangex.adapter import OrangeXAdapter
 from exchange.orangex.client import OrangeXClient
@@ -110,7 +116,8 @@ async def _run_single_direction(
     binance_http_client: Optional[httpx.AsyncClient] = None,
     on_engine_ready: Optional[Callable[[GridEngine], None]] = None,
     entry_mode: Optional[EntryMode] = None,
-) -> None:
+    cycle_restart_policy: CycleRestartPolicy = CycleRestartPolicy.RESET_IN_PLACE,
+) -> Optional[CycleOutcome]:
     """방향 하나(`settings.direction`이 "long" 또는 "short")의 엔진 스택 전체를 조립해서
     계속 돌린다. 원래 `run()`의 본문이었으나, direction="both" 지원을 위해 `run()`이
     이 함수를 롱/숏 각각의 독립된 `Settings` 사본으로 두 번(동시에) 호출하도록 분리했다.
@@ -171,8 +178,10 @@ async def _run_single_direction(
         contract_spec=contract_spec,
         settings=settings,
         poll_interval_seconds=settings.cycle_manager_poll_interval_seconds,
+        restart_policy=cycle_restart_policy,
     )
 
+    cycle_task = asyncio.create_task(cycle_manager.run(), name=f"cycle_manager-{settings.direction}")
     tasks = [
         asyncio.create_task(fill_router.run(), name=f"fill_router-{settings.direction}"),
         asyncio.create_task(entry_scheduler.run(), name=f"entry_scheduler-{settings.direction}"),
@@ -180,12 +189,22 @@ async def _run_single_direction(
             _price_watch_loop(market_data_adapter, execution_adapter, engine, settings),
             name=f"price_watch-{settings.direction}",
         ),
-        asyncio.create_task(cycle_manager.run(), name=f"cycle_manager-{settings.direction}"),
+        cycle_task,
     ]
 
     try:
-        done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        # FIRST_EXCEPTION이 아니라 FIRST_COMPLETED다. 두 가지 이유:
+        # (1) REBUILD_STACK 정책에서 cycle_manager가 "사이클 끝남"을 값으로 반환하는데,
+        #     FIRST_EXCEPTION은 정상 종료한 태스크로는 깨지 않는다(ALL_COMPLETED로 degrade).
+        # (2) 그 degrade 자체가 원래 잠재적 행(hang)이었다 — 네 태스크 중 하나가 예외
+        #     없이 끝나면 FillRouter가 죽은 채 포지션을 든 상태로 영원히 대기하게 된다.
+        #     이제는 예상 밖 정상 종료를 RuntimeError로 드러낸다.
+        done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
+            # FIRST_COMPLETED에서는 취소된 태스크도 done에 들어온다. 그 상태로
+            # task.exception()을 부르면 CancelledError가 엉뚱한 데서 튀어나온다.
+            if task.cancelled():
+                raise asyncio.CancelledError(f"{task.get_name()}가 외부에서 취소됨")
             exc = task.exception()
             if exc is not None:
                 logger.critical("[%s] 태스크 %s가 예외로 종료됨 — 이 방향 봇 정지: %r", settings.direction, task.get_name(), exc)
@@ -195,12 +214,162 @@ async def _run_single_direction(
                     # COOLDOWN을 구분 못 함).
                     write_halt_flag(settings.halt_flag_path, str(exc))
                 raise exc
+        if cycle_task in done:
+            return cycle_task.result()
+        raise RuntimeError(
+            "예외 없이 정상 종료된 태스크가 있음 — 원인을 추측하지 않고 이 방향 봇을 정지한다: "
+            + ", ".join(t.get_name() for t in done)
+        )
     finally:
         # 정상 종료든(위 raise) run() 자체가 외부에서 취소되든, 백그라운드 태스크가
         # 고아 상태로 계속 도는 일이 없도록 항상 여기서 정리한다.
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _build_shared_rest_client(settings: Settings) -> Optional[OrangeXClient]:
+    """방향/사이클을 넘나들며 공유하는 REST 클라이언트. live가 아니면 None
+    (`build_execution_adapter`가 무시한다).
+
+    `auth_grant_type` 명시가 핵심이다 — 기본값 `client_signature`는 이 프로젝트에서
+    안정적으로 성공한 적이 없다(2026-08-06 실전 사고, engine/grid_setup.py 참고).
+    클라이언트를 공유하는 이유는 계정 전체 레이트리밋(10 req/s)이 클라이언트별로
+    독립 스로틀되면 합쳐서 한도를 넘길 수 있어서다."""
+    if settings.trading_mode != "live":
+        return None
+    return OrangeXClient(
+        client_id=settings.api_key.get_secret_value(),
+        client_secret=settings.api_secret.get_secret_value(),
+        auth_grant_type="client_credentials",
+    )
+
+
+async def _assert_cycle_closed_out(
+    adapter: ExchangeAdapter, instrument: str, direction: str
+) -> None:
+    """다음 사이클을 (다른 방향일 수도 있는 채로) 시작하기 전에, 방금 끝난 방향이
+    정말로 비었는지 **그 방향 어댑터로** 확인한다.
+
+    새 사이클의 어댑터는 새 `position_side`로만 조회하므로(헤지 모드 필터링,
+    `exchange/orangex/adapter.py`) 직전 방향에 남은 잔여 포지션을 원리적으로 볼 수
+    없다 — 여기서 막지 않으면 의도치 않은 양방향 보유가 조용히 만들어진다."""
+    position = await adapter.get_position(instrument)
+    if position.qty != 0:
+        raise StartupError(
+            f"직전 사이클({direction}) 포지션이 flat이 아님(qty={position.qty}) — "
+            "다음 사이클을 시작하지 않는다. 거래소에서 직접 확인해라."
+        )
+    leftovers = [
+        o for o in await adapter.get_open_orders(instrument)
+        if o.status in ("open", "partially_filled")
+    ]
+    if leftovers:
+        raise StartupError(
+            f"직전 사이클({direction})의 미체결 주문 {len(leftovers)}건이 남아있음 — "
+            "다음 사이클을 시작하지 않는다."
+        )
+
+
+async def _resolve_direction_for_next_cycle(
+    settings: Settings,
+    contract_spec: ContractSpec,
+    shared_client: Optional[OrangeXClient],
+    binance_http_client: Optional[httpx.AsyncClient],
+    probe_exchange: bool,
+) -> Direction:
+    """이번 사이클의 방향을 정한다. 거래소에 이어받을 상태가 있으면 그게 RSI보다 우선한다.
+
+    `probe_exchange`는 프로세스 시작 직후(첫 사이클)에만 True다 — 그 이후의 사이클은
+    `_assert_cycle_closed_out()`이 직전 방향이 완전히 비었음을 이미 확인했으므로
+    프로브가 불필요하고, 매 사이클 WS 연결 2개를 새로 여는 낭비만 된다."""
+    if probe_exchange and settings.trading_mode == "live":
+        long_probe = build_execution_adapter(
+            settings.model_copy(update={"direction": "long"}), contract_spec,
+            shared_client=shared_client,
+        )
+        short_probe = build_execution_adapter(
+            settings.model_copy(update={"direction": "short"}), contract_spec,
+            shared_client=shared_client,
+        )
+        try:
+            recovered = await detect_open_direction(long_probe, short_probe, settings.symbol)
+        finally:
+            await long_probe.aclose()
+            await short_probe.aclose()
+        if recovered is not None:
+            logger.warning(
+                "재시작 복구: 거래소에 %s 포지션/주문이 남아있어 15분봉 RSI 재판정을 "
+                "건너뛰고 그 방향으로 이어받는다", recovered,
+            )
+            return recovered
+
+    decision = await decide_direction_with_retry(settings.symbol, http_client=binance_http_client)
+    logger.info(
+        "15분봉 RSI(14)=%s -> 이번 사이클 방향: %s (임계값 50)", decision.rsi, decision.direction
+    )
+    return decision.direction
+
+
+async def _run_auto_direction(
+    settings: Settings,
+    market_data_adapter: OrangeXAdapter,
+    contract_spec: ContractSpec,
+    binance_http_client: Optional[httpx.AsyncClient] = None,
+    on_engine_ready: Optional[Callable[[GridEngine], None]] = None,
+) -> None:
+    """`DIRECTION=auto` — 사이클마다 15분봉 RSI(14)로 방향을 다시 정하고(>=50 숏, <50 롱),
+    그 방향으로 실행 어댑터/엔진/백그라운드 태스크를 통째로 새로 조립해 한 사이클을 돌린다.
+
+    방향을 제자리에서 바꾸지 않고 스택째 다시 만드는 이유: `OrangeXAdapter`의
+    `position_side`가 생성 시점에 고정되고, 헤지 모드에서 이 값이 틀리면 주문이 접수
+    직후 자동 취소된다(error 5998). 네 태스크가 도는 중에 락 없이 private 필드를 바꾸는
+    건 이 프로젝트가 이미 여러 번 당한 유형의 사고다."""
+    if settings.manual_mode:
+        raise ValueError(
+            'direction="auto"와 manual_mode=True는 같이 쓸 수 없다 — manual_mode에서는 '
+            "TP/청산 자동화가 꺼져 있어 사이클이 COOLDOWN에 도달하는 경로 자체가 없고, "
+            "그러면 방향을 다시 판정할 시점이 영원히 오지 않는다."
+        )
+
+    shared_client = _build_shared_rest_client(settings)
+    # PaperAdapter는 direction을 아예 안 받으므로(방향 무관) 사이클 간 재사용한다 —
+    # 매번 새로 만들면 가상 잔고/포지션이 초기화돼 다중 사이클 검증이 무의미해진다.
+    reuse_adapter = settings.trading_mode != "live"
+    execution_adapter: Optional[ExchangeAdapter] = None
+    probe_exchange = True
+
+    try:
+        while True:
+            direction = await _resolve_direction_for_next_cycle(
+                settings, contract_spec, shared_client, binance_http_client, probe_exchange
+            )
+            probe_exchange = False
+            cycle_settings = settings.model_copy(update={"direction": direction})
+
+            if execution_adapter is None:
+                execution_adapter = build_execution_adapter(
+                    cycle_settings, contract_spec, shared_client=shared_client
+                )
+
+            outcome = await _run_single_direction(
+                cycle_settings, market_data_adapter, contract_spec, execution_adapter,
+                binance_http_client, on_engine_ready,
+                entry_mode=EntryMode.IMMEDIATE,
+                cycle_restart_policy=CycleRestartPolicy.REBUILD_STACK,
+            )
+            if outcome is not CycleOutcome.REBUILD_REQUESTED:
+                return
+
+            await _assert_cycle_closed_out(execution_adapter, cycle_settings.symbol, direction)
+            if not reuse_adapter:
+                await execution_adapter.aclose()
+                execution_adapter = None
+    finally:
+        if execution_adapter is not None:
+            await execution_adapter.aclose()
+        if shared_client is not None:
+            await shared_client.aclose()
 
 
 async def run(
@@ -222,6 +391,17 @@ async def run(
     if market_data_adapter is None:
         market_data_adapter = build_market_data_adapter(settings)
     contract_spec = await market_data_adapter.get_contract_spec(settings.symbol)
+
+    if settings.direction == "auto":
+        if execution_adapter is not None:
+            raise ValueError(
+                'direction="auto"에서는 execution_adapter를 미리 주입할 수 없음 — '
+                "사이클마다 방향이 바뀌어 새로 만든다"
+            )
+        await _run_auto_direction(
+            settings, market_data_adapter, contract_spec, binance_http_client, on_engine_ready
+        )
+        return
 
     if settings.direction != "both":
         await _run_single_direction(
