@@ -123,6 +123,9 @@ async def _run_single_direction(
             max_open_grid_orders=settings.max_open_grid_orders,
             manual_mode=settings.manual_mode,
             mandatory_sl_min_tier=settings.mandatory_sl_min_tier,
+            # 거래소 수량 정밀도(qty_step) 반올림용 — 없으면 compute_grid()의 미가공
+            # 수량이 그대로 나가 라이브에서 전 주문이 거부된다(2026-08-17).
+            contract_spec=contract_spec,
         )
     except RestartRecoveryError as e:
         raise StartupError(f"재시작 복구 실패 — 거래소 상태와 격자 계산이 안 맞음: {e!r}") from e

@@ -34,18 +34,50 @@ COOLDOWN 이후 다음 사이클로 재진입하는 타이머는 `engine/cycle_m
 """
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
 from typing import Optional
 
-from exchange.base import ExchangeAdapter, MarketOrderRequest, OrderRequest, StopOrderRequest
+from exchange.base import (
+    ContractSpec,
+    ExchangeAdapter,
+    MarketOrderRequest,
+    OrderRequest,
+    StopOrderRequest,
+    round_qty_to_step,
+)
 from strategy.grid import GridStepResult
 from strategy.liquidation import Direction
 
+logger = logging.getLogger(__name__)
+
 HYBRID_RESET_MIN_TIER = 3
 HYBRID_RESET_FRACTION = Decimal("0.5")
+
+
+class OrderQtyTooSmallError(Exception):
+    """거래소 수량 정밀도(qty_step)로 내린 결과가 최소 주문 수량/명목가치에 미달.
+    애매한 주문을 내보내 거래소가 조용히 거부하게 두지 않고 여기서 명시적으로 막는다
+    (SPEC 0번). 정상 운용에서는 `engine/grid_setup.py`의 `build_grid_rows()`가 기동
+    시점에 이미 걸러내므로 도달하지 않아야 하는 방어선이다."""
+
+
+def rounded_cum_qty(
+    grid_rows: list[GridStepResult], count: int, qty_step: Decimal
+) -> Decimal:
+    """0..count-1 단계를 실제 주문 수량(내림 적용)으로 누적한 값.
+
+    `grid_rows[i].cum_qty`는 미가공 수량의 누적이라 실제 포지션과 다르다 — 엔진이
+    거래소에 보내는 건 항상 `round_qty_to_step()`으로 내린 값이기 때문이다.
+    `engine/restart_recovery.py`가 거래소 실측 포지션과 대조할 때 반드시 이 함수를
+    써야 엔진과 동일한 산술이 된다(양쪽이 어긋나면 재시작이 무조건 실패한다)."""
+    total = Decimal("0")
+    for row in grid_rows[:count]:
+        total += round_qty_to_step(row.step_qty, qty_step)
+    return total
 
 
 class EngineState(Enum):
@@ -79,6 +111,10 @@ class GridEngine:
     # (예: 3-tier 압축 설계) 이 값도 같이 낮춰야 major_tier가 실제로 도달 가능한
     # 값이 된다(2026-08-04, 제까깟-마틴게이-3k.xlsx 검증 후 설정 가능하게 뺌).
     mandatory_sl_min_tier: int = 4
+    # 거래소 수량 정밀도(qty_step)/최소 주문 조건 판정용. None이면 반올림하지 않고
+    # 미가공 수량을 그대로 주문에 넣는다(기존 테스트 호출부와 하위호환) — 라이브
+    # 운용에서는 반드시 실제 조회한 스펙을 넘겨야 한다(main.py가 배선한다).
+    contract_spec: Optional[ContractSpec] = None
 
     state: EngineState = field(default=EngineState.IDLE)
     filled_step_count: int = 0
@@ -106,6 +142,38 @@ class GridEngine:
     def _check_not_halted(self) -> None:
         if self.halted:
             raise EngineHaltedError("엔진이 정지 상태 — 재시작 복구 절차 필요")
+
+    def _order_qty(self, raw_qty: Decimal, price: Decimal, what: str) -> Decimal:
+        """주문에 실제로 넣을 수량 — 거래소 수량 단위로 내리고 최소 조건을 검증한다.
+
+        `contract_spec`이 없으면 원본을 그대로 돌려준다(하위호환). `price`는 명목가치
+        판정용이며 시장가 청산에서는 마지막으로 아는 가격을 넘긴다."""
+        if self.contract_spec is None:
+            return raw_qty
+        qty = round_qty_to_step(raw_qty, self.contract_spec.qty_step)
+        if qty < self.contract_spec.min_qty or qty * price < self.contract_spec.min_notional:
+            raise OrderQtyTooSmallError(
+                f"{what}: 수량 {raw_qty}를 {self.contract_spec.qty_step} 단위로 내리면 {qty} — "
+                f"최소 주문 수량({self.contract_spec.min_qty}) 또는 명목가치"
+                f"({self.contract_spec.min_notional})에 미달한다"
+            )
+        return qty
+
+    def _closing_qty(self, raw_qty: Decimal) -> Decimal:
+        """청산 수량 — 내림만 하고 최소 조건 미달이어도 **예외를 던지지 않는다.**
+        강제청산 경로는 이미 비상 상황이라 여기서 멈추면 포지션이 그대로 남는다.
+        거부는 거래소가 하게 두되 반드시 로그를 남긴다(내림 때문에 dust가 남을 수 있음)."""
+        if self.contract_spec is None:
+            return raw_qty
+        qty = round_qty_to_step(raw_qty, self.contract_spec.qty_step)
+        if qty != raw_qty:
+            logger.info("청산 수량 내림: %s -> %s (잔여 dust %s)", raw_qty, qty, raw_qty - qty)
+        if qty < self.contract_spec.min_qty:
+            logger.warning(
+                "청산 수량 %s가 최소 주문 수량(%s) 미달 — 거래소가 거부할 수 있다. 수동 확인 필요",
+                qty, self.contract_spec.min_qty,
+            )
+        return qty
 
     async def start_scouting(self) -> None:
         """IDLE -> SCOUTING 전이. 진입 필터(RSI 등) 통과를 기다리는 상태로만 들어가고
@@ -137,7 +205,7 @@ class GridEngine:
                 instrument=self.instrument,
                 side=self._entry_side(),
                 price=row.entry_price,
-                qty=row.step_qty,
+                qty=self._order_qty(row.step_qty, row.entry_price, f"격자 진입 {idx}단계"),
                 client_order_id=f"grid-{idx}-{uuid.uuid4().hex[:8]}",
             )
             result = await self.adapter.place_limit_order(order)
@@ -151,7 +219,10 @@ class GridEngine:
         self.resting_grid_order_ids.pop(grid_index, None)
         self.filled_step_count = max(self.filled_step_count, grid_index + 1)
         row = self._current_row()
-        self.open_qty += row.step_qty
+        # 실제로 주문에 넣었던(내림된) 수량으로 누적한다 — 미가공 step_qty로 더하면
+        # 엔진이 아는 수량과 거래소 실제 포지션이 어긋나고, 그 오차가 TP/SL/청산 주문
+        # 수량에 그대로 전파된다.
+        self.open_qty += self._order_qty(row.step_qty, row.entry_price, f"격자 진입 {grid_index}단계")
 
         if not self.manual_mode:
             await self._reregister_tp(row)
@@ -181,7 +252,7 @@ class GridEngine:
             instrument=self.instrument,
             side=self._exit_side(),
             price=row.target_tp_price,
-            qty=self.open_qty,
+            qty=self._order_qty(self.open_qty, row.target_tp_price, f"TP 재등록 {row.index}단계"),
             client_order_id=f"tp-{row.index}-{uuid.uuid4().hex[:8]}",
             reduce_only=True,
         )
@@ -202,7 +273,7 @@ class GridEngine:
             instrument=self.instrument,
             side=self._exit_side(),
             trigger_price=row.sl_price,
-            qty=self.open_qty,
+            qty=self._order_qty(self.open_qty, row.sl_price, f"SL 재등록 {row.index}단계"),
             client_order_id=f"sl-{row.index}-{uuid.uuid4().hex[:8]}",
             reduce_only=True,
         )
@@ -223,7 +294,7 @@ class GridEngine:
         order = MarketOrderRequest(
             instrument=self.instrument,
             side=self._exit_side(),
-            qty=self.open_qty,
+            qty=self._closing_qty(self.open_qty),
             client_order_id=f"forceclose-{row.index}-{uuid.uuid4().hex[:8]}",
             reduce_only=True,
         )
@@ -245,7 +316,12 @@ class GridEngine:
         if not reached:
             return False
 
-        close_qty = self.open_qty * HYBRID_RESET_FRACTION
+        close_qty = self._closing_qty(self.open_qty * HYBRID_RESET_FRACTION)
+        if self.contract_spec is not None and close_qty < self.contract_spec.min_qty:
+            # hybrid reset은 선택적 리스크 완화라, 최소 주문 조건을 못 채우면 거부당할
+            # 주문을 보내는 대신 이번엔 건너뛴다(다음 폴링에서 다시 판정된다).
+            logger.warning("hybrid reset 청산 수량이 최소 주문 미달 — 이번 판정은 건너뜀")
+            return False
         order = MarketOrderRequest(
             instrument=self.instrument,
             side=self._exit_side(),

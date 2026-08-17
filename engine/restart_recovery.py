@@ -38,8 +38,9 @@ from engine.grid_engine import (
     HYBRID_RESET_MIN_TIER,
     EngineState,
     GridEngine,
+    rounded_cum_qty,
 )
-from exchange.base import ExchangeAdapter
+from exchange.base import ContractSpec, ExchangeAdapter, round_qty_to_step
 from strategy.grid import GridStepResult
 from strategy.liquidation import Direction
 
@@ -87,6 +88,7 @@ async def reconstruct_state(
     direction: Direction,
     manual_mode: bool = False,
     mandatory_sl_min_tier: int = 4,
+    contract_spec: Optional[ContractSpec] = None,
 ) -> RecoveredState:
     position = await adapter.get_position(instrument)
     open_orders = await adapter.get_open_orders(instrument)
@@ -187,21 +189,32 @@ async def reconstruct_state(
         if not sl_required and sl_order_id is not None:
             raise RestartRecoveryError(f"tier {row.major_tier}인데 SL 주문이 존재함 — 예상 밖 상태")
 
+        # 엔진은 항상 qty_step으로 내린 수량을 주문에 넣으므로, 실제 포지션은 미가공
+        # row.cum_qty가 아니라 "내림된 step_qty들의 합"이다. GridEngine과 반드시 동일한
+        # 산술을 써야 한다(rounded_cum_qty / _closing_qty가 하는 것과 같은 순서).
+        qty_step = contract_spec.qty_step if contract_spec is not None else Decimal("0")
+        expected_qty = rounded_cum_qty(grid_rows, filled_step_count, qty_step)
+        # hybrid reset은 그 시점의 보유 수량 절반을 다시 내림해서 청산한다 —
+        # 잔량은 (전체 - 내림된 절반)이지 전체의 정확한 절반이 아니다.
+        expected_after_hybrid = expected_qty - round_qty_to_step(
+            expected_qty * HYBRID_RESET_FRACTION, qty_step
+        )
+
         if row.major_tier < HYBRID_RESET_MIN_TIER:
-            if position.qty != row.cum_qty:
+            if position.qty != expected_qty:
                 raise RestartRecoveryError(
                     f"tier {row.major_tier}에서 hybrid reset이 있을 수 없는데 포지션 수량({position.qty})이 "
-                    f"이론치({row.cum_qty})와 다름"
+                    f"이론치({expected_qty})와 다름"
                 )
             hybrid_reset_done = False
-        elif position.qty == row.cum_qty:
+        elif position.qty == expected_qty:
             hybrid_reset_done = False
-        elif position.qty == row.cum_qty * (Decimal("1") - HYBRID_RESET_FRACTION):
+        elif position.qty == expected_after_hybrid:
             hybrid_reset_done = True
         else:
             raise RestartRecoveryError(
-                f"포지션 수량({position.qty})이 이론치({row.cum_qty}) 또는 hybrid reset 이후 수량"
-                f"({row.cum_qty * (Decimal('1') - HYBRID_RESET_FRACTION)}) 어느 쪽과도 안 맞음"
+                f"포지션 수량({position.qty})이 이론치({expected_qty}) 또는 hybrid reset 이후 수량"
+                f"({expected_after_hybrid}) 어느 쪽과도 안 맞음"
             )
 
     return RecoveredState(
@@ -223,11 +236,13 @@ async def build_recovered_engine(
     max_open_grid_orders: int = 5,
     manual_mode: bool = False,
     mandatory_sl_min_tier: int = 4,
+    contract_spec: Optional[ContractSpec] = None,
 ) -> GridEngine:
     """`reconstruct_state()`로 재구성한 값을 실제로 사용 가능한 `GridEngine`에 채워 넣는다."""
     recovered = await reconstruct_state(
         adapter, instrument, grid_rows, direction,
         manual_mode=manual_mode, mandatory_sl_min_tier=mandatory_sl_min_tier,
+        contract_spec=contract_spec,
     )
     engine = GridEngine(
         adapter=adapter,
@@ -237,6 +252,7 @@ async def build_recovered_engine(
         max_open_grid_orders=max_open_grid_orders,
         manual_mode=manual_mode,
         mandatory_sl_min_tier=mandatory_sl_min_tier,
+        contract_spec=contract_spec,
     )
     engine.state = recovered.state
     engine.filled_step_count = recovered.filled_step_count

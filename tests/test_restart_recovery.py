@@ -488,3 +488,134 @@ async def test_quantity_matching_neither_theoretical_nor_hybrid_raises():
 
     with pytest.raises(RestartRecoveryError):
         await reconstruct_state(adapter, INSTRUMENT, rows, "long")
+
+
+# --------------------------------------------------------------------------
+# 수량 정밀도(qty_step) 반영 — 2026-08-17.
+# 엔진이 내림된 수량으로 주문하면 실제 포지션은 "내림된 step_qty들의 합"이 되므로,
+# 미가공 row.cum_qty와 정확히 일치하는지 보던 기존 검증은 항상 실패한다.
+# --------------------------------------------------------------------------
+
+
+def make_spec_with_step() -> ContractSpec:
+    return ContractSpec(
+        instrument=INSTRUMENT, tick_size=Decimal("50"), min_qty=Decimal("0.001"),
+        min_notional=Decimal("10"), contract_size=Decimal("1"), qty_step=Decimal("0.001"),
+    )
+
+
+def make_messy_rows() -> list[GridStepResult]:
+    """0.001 단위로 내리면 0.003 / 0.002 / 0.002 (합 0.007)."""
+    raw = [
+        Decimal("0.003912345678901234567890"),
+        Decimal("0.002987654321098765432109"),
+        Decimal("0.002111111111111111111111"),
+    ]
+    prices = [Decimal("64000"), Decimal("63900"), Decimal("63800")]
+    avgs = [Decimal("64000"), Decimal("63950"), Decimal("63900")]
+    tps = [Decimal("64640"), Decimal("64590"), Decimal("64220")]
+    sls = [Decimal("62080"), Decimal("62031"), Decimal("61983")]
+    rows = []
+    for i in range(3):
+        row = make_row(i, i + 1, prices[i], avgs[i], tps[i], sls[i])
+        rows.append(
+            GridStepResult(
+                index=row.index, major_tier=row.major_tier, sub_step=row.sub_step,
+                entry_price=row.entry_price, weight=row.weight, step_qty=raw[i],
+                step_margin=row.step_margin, cum_qty=sum(raw[: i + 1], Decimal("0")),
+                cum_margin=row.cum_margin, avg_price=row.avg_price,
+                available_balance=row.available_balance, liq_price=row.liq_price,
+                target_roe=row.target_roe, target_tp_price=row.target_tp_price, sl_price=row.sl_price,
+            )
+        )
+    return rows
+
+
+def make_adapter_with_step() -> PaperAdapter:
+    return PaperAdapter(
+        instrument=INSTRUMENT, contract_spec=make_spec_with_step(), initial_equity=Decimal("10000"),
+        leverage=Decimal("20"), maker_fee=Decimal("0.0002"), taker_fee=Decimal("0.0006"),
+    )
+
+
+async def fill_rounded(adapter, engine, rows, index: int, qty: Decimal) -> None:
+    order_id = engine.resting_grid_order_ids[index]
+    await adapter.fill_order(order_id, qty=qty, price=rows[index].entry_price)
+    await adapter.on_price_tick(rows[index].entry_price)
+    await engine.on_fill(index)
+
+
+@pytest.mark.asyncio
+async def test_reconstructs_position_built_from_rounded_quantities():
+    """엔진이 내림된 수량으로 주문했으면 복구도 같은 산술로 기대치를 계산해야 한다."""
+    adapter = make_adapter_with_step()
+    spec = make_spec_with_step()
+    rows = make_messy_rows()
+    old_engine = GridEngine(
+        adapter=adapter, instrument=INSTRUMENT, direction="long", grid_rows=rows,
+        max_open_grid_orders=3, contract_spec=spec,
+    )
+    await old_engine.start_laddering()
+    await fill_rounded(adapter, old_engine, rows, 0, Decimal("0.003"))
+    await fill_rounded(adapter, old_engine, rows, 1, Decimal("0.002"))
+
+    recovered = await reconstruct_state(adapter, INSTRUMENT, rows, "long", contract_spec=spec)
+
+    assert recovered.state == EngineState.LADDERING
+    assert recovered.filled_step_count == 2
+    assert recovered.open_qty == old_engine.open_qty == Decimal("0.005")
+    assert recovered.hybrid_reset_done is False
+
+
+@pytest.mark.asyncio
+async def test_reconstruct_without_contract_spec_rejects_rounded_position():
+    """contract_spec을 안 넘기면 미가공 cum_qty와 대조하므로 불일치로 막혀야 한다 —
+    배선을 빠뜨리면 조용히 잘못 복구되는 게 아니라 확실히 실패하는지 확인."""
+    adapter = make_adapter_with_step()
+    rows = make_messy_rows()
+    old_engine = GridEngine(
+        adapter=adapter, instrument=INSTRUMENT, direction="long", grid_rows=rows,
+        max_open_grid_orders=3, contract_spec=make_spec_with_step(),
+    )
+    await old_engine.start_laddering()
+    await fill_rounded(adapter, old_engine, rows, 0, Decimal("0.003"))
+
+    with pytest.raises(RestartRecoveryError):
+        await reconstruct_state(adapter, INSTRUMENT, rows, "long")
+
+
+@pytest.mark.asyncio
+async def test_reconstructs_hybrid_reset_residual_with_rounding():
+    """open_qty 0.007의 절반은 0.0035 -> 내림 0.003만 청산되고 0.004가 남는다.
+    복구도 엔진과 정확히 같은 순서로 계산해야 이 잔량을 hybrid 이후로 인식한다."""
+    adapter = make_adapter_with_step()
+    spec = make_spec_with_step()
+    rows = make_messy_rows()
+    old_engine = GridEngine(
+        adapter=adapter, instrument=INSTRUMENT, direction="long", grid_rows=rows,
+        max_open_grid_orders=3, contract_spec=spec,
+    )
+    await old_engine.start_laddering()
+    await fill_rounded(adapter, old_engine, rows, 0, Decimal("0.003"))
+    await fill_rounded(adapter, old_engine, rows, 1, Decimal("0.002"))
+    await fill_rounded(adapter, old_engine, rows, 2, Decimal("0.002"))
+    assert await old_engine.maybe_hybrid_reset(rows[2].avg_price) is True
+    assert old_engine.open_qty == Decimal("0.004")
+
+    recovered = await reconstruct_state(adapter, INSTRUMENT, rows, "long", contract_spec=spec)
+
+    assert recovered.hybrid_reset_done is True
+    assert recovered.open_qty == Decimal("0.004")
+
+
+@pytest.mark.asyncio
+async def test_build_recovered_engine_passes_contract_spec_to_engine():
+    adapter = make_adapter_with_step()
+    spec = make_spec_with_step()
+    rows = make_messy_rows()
+
+    engine = await build_recovered_engine(
+        adapter, INSTRUMENT, "long", rows, max_open_grid_orders=3, contract_spec=spec,
+    )
+
+    assert engine.contract_spec is spec

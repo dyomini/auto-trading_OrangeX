@@ -10,7 +10,7 @@ from decimal import Decimal
 
 import pytest
 
-from engine.grid_engine import EngineHaltedError, EngineState, GridEngine
+from engine.grid_engine import EngineHaltedError, EngineState, GridEngine, OrderQtyTooSmallError
 from exchange.base import ContractSpec, StopOrderRequest
 from exchange.paper import PaperAdapter
 from strategy.grid import GridStepResult
@@ -18,14 +18,22 @@ from strategy.grid import GridStepResult
 INSTRUMENT = "BTC-USDT-PERP"
 
 
-def make_row(index: int, major_tier: int, entry_price: Decimal, avg_price: Decimal, tp: Decimal, sl: Decimal) -> GridStepResult:
+def make_row(
+    index: int,
+    major_tier: int,
+    entry_price: Decimal,
+    avg_price: Decimal,
+    tp: Decimal,
+    sl: Decimal,
+    step_qty: Decimal = Decimal("0.01"),
+) -> GridStepResult:
     return GridStepResult(
         index=index,
         major_tier=major_tier,
         sub_step=1,
         entry_price=entry_price,
         weight=Decimal("1"),
-        step_qty=Decimal("0.01"),
+        step_qty=step_qty,
         step_margin=Decimal("100"),
         cum_qty=Decimal("0.01") * (index + 1),
         cum_margin=Decimal("100") * (index + 1),
@@ -439,6 +447,191 @@ async def test_manual_mode_stays_laddering_after_all_rows_filled():
 
     assert engine.state == EngineState.LADDERING  # TP_PENDING으로 안 넘어감(TP 자체가 없음)
     assert engine.open_qty == sum((r.step_qty for r in rows), Decimal("0"))
+
+
+# --------------------------------------------------------------------------
+# 수량 정밀도(qty_step) 반올림 — 2026-08-17.
+# quick_entry.py는 2026-08-06에 고쳤지만 메인 엔진은 미가공 수량을 그대로 주문에 넣고
+# 있었다(라이브면 거래소가 정밀도 불일치로 전부 거부). docs/phase3-plan.md 참고.
+# --------------------------------------------------------------------------
+
+# 실제 BTC-USDT-PERPETUAL 값(min_trade_amount=0.001)을 반영한 스펙.
+# 위 make_spec()은 qty_step 미지정(=0, "반올림 안 함")이라 기존 테스트는 영향을 안 받는다.
+def make_spec_with_step() -> ContractSpec:
+    return ContractSpec(
+        instrument=INSTRUMENT, tick_size=Decimal("50"), min_qty=Decimal("0.001"),
+        min_notional=Decimal("10"), contract_size=Decimal("1"), qty_step=Decimal("0.001"),
+    )
+
+
+class _RecordingAdapter(PaperAdapter):
+    """엔진이 실제로 어떤 수량을 주문했는지 확인하기 위해 요청 객체를 그대로 기록한다
+    (PaperAdapter.get_open_orders()는 OrderResult만 돌려줘서 주문 수량이 안 보인다)."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.limit_requests: list = []
+        self.stop_requests: list = []
+        self.market_requests: list = []
+
+    async def place_limit_order(self, order):
+        self.limit_requests.append(order)
+        return await super().place_limit_order(order)
+
+    async def place_stop_order(self, order):
+        self.stop_requests.append(order)
+        return await super().place_stop_order(order)
+
+    async def place_market_order(self, order):
+        self.market_requests.append(order)
+        return await super().place_market_order(order)
+
+
+def make_messy_rows() -> list[GridStepResult]:
+    """compute_grid()가 실제로 만드는 형태의 "지저분한" 수량 — 나눗셈 결과라 소수점이
+    한참 이어진다. 0.001 단위로 내리면 각각 0.003 / 0.002 / 0.002 (합 0.007)."""
+    return [
+        make_row(0, 1, Decimal("64000"), Decimal("64000"), Decimal("64640"), Decimal("62080"),
+                 step_qty=Decimal("0.003912345678901234567890")),
+        make_row(1, 2, Decimal("63900"), Decimal("63950"), Decimal("64590"), Decimal("62031"),
+                 step_qty=Decimal("0.002987654321098765432109")),
+        make_row(2, 3, Decimal("63800"), Decimal("63900"), Decimal("64220"), Decimal("61983"),
+                 step_qty=Decimal("0.002111111111111111111111")),
+    ]
+
+
+async def fill_rounded(adapter: PaperAdapter, engine: GridEngine, rows, index: int, qty: Decimal) -> None:
+    """엔진이 실제로 건 (반올림된) 수량 그대로 체결시킨다."""
+    order_id = engine.resting_grid_order_ids[index]
+    await adapter.fill_order(order_id, qty=qty, price=rows[index].entry_price)
+    await adapter.on_price_tick(rows[index].entry_price)
+    await engine.on_fill(index)
+
+
+@pytest.mark.asyncio
+async def test_grid_entry_qty_is_rounded_down_to_qty_step():
+    adapter = _RecordingAdapter(
+        instrument=INSTRUMENT, contract_spec=make_spec_with_step(), initial_equity=Decimal("10000"),
+        leverage=Decimal("20"), maker_fee=Decimal("0.0002"), taker_fee=Decimal("0.0006"),
+    )
+    rows = make_messy_rows()
+    engine = GridEngine(
+        adapter=adapter, instrument=INSTRUMENT, direction="long", grid_rows=rows,
+        max_open_grid_orders=3, contract_spec=make_spec_with_step(),
+    )
+
+    await engine.start_laddering()
+
+    assert [o.qty for o in adapter.limit_requests] == [
+        Decimal("0.003"), Decimal("0.002"), Decimal("0.002")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_open_qty_accumulates_the_rounded_quantity_not_the_raw_one():
+    """엔진이 아는 수량과 거래소 실제 포지션이 어긋나면 그 오차가 TP/청산 주문 수량에
+    그대로 전파된다 — 누적도 반드시 반올림된 값이어야 한다."""
+    adapter = _RecordingAdapter(
+        instrument=INSTRUMENT, contract_spec=make_spec_with_step(), initial_equity=Decimal("10000"),
+        leverage=Decimal("20"), maker_fee=Decimal("0.0002"), taker_fee=Decimal("0.0006"),
+    )
+    rows = make_messy_rows()
+    engine = GridEngine(
+        adapter=adapter, instrument=INSTRUMENT, direction="long", grid_rows=rows,
+        max_open_grid_orders=3, contract_spec=make_spec_with_step(), manual_mode=True,
+    )
+    await engine.start_laddering()
+
+    await fill_rounded(adapter, engine, rows, 0, Decimal("0.003"))
+    await fill_rounded(adapter, engine, rows, 1, Decimal("0.002"))
+
+    assert engine.open_qty == Decimal("0.005")  # 0.003912... + 0.002987... 이 아니라
+
+
+@pytest.mark.asyncio
+async def test_tp_order_qty_is_rounded_down_to_qty_step():
+    adapter = _RecordingAdapter(
+        instrument=INSTRUMENT, contract_spec=make_spec_with_step(), initial_equity=Decimal("10000"),
+        leverage=Decimal("20"), maker_fee=Decimal("0.0002"), taker_fee=Decimal("0.0006"),
+    )
+    rows = make_messy_rows()
+    engine = GridEngine(
+        adapter=adapter, instrument=INSTRUMENT, direction="long", grid_rows=rows,
+        max_open_grid_orders=3, contract_spec=make_spec_with_step(),
+    )
+    await engine.start_laddering()
+    entry_count = len(adapter.limit_requests)
+
+    await fill_rounded(adapter, engine, rows, 0, Decimal("0.003"))
+
+    tp_requests = [o for o in adapter.limit_requests[entry_count:] if o.reduce_only]
+    assert len(tp_requests) == 1
+    assert tp_requests[0].qty == Decimal("0.003")
+
+
+@pytest.mark.asyncio
+async def test_hybrid_reset_close_qty_is_rounded_and_residual_tracked():
+    """open_qty=0.007의 절반은 0.0035 — 0.001 배수가 아니라 내림해서 0.003만 청산되고
+    잔량 0.004가 남는다. 엔진의 open_qty도 정확히 그 잔량이어야 한다."""
+    adapter = _RecordingAdapter(
+        instrument=INSTRUMENT, contract_spec=make_spec_with_step(), initial_equity=Decimal("10000"),
+        leverage=Decimal("20"), maker_fee=Decimal("0.0002"), taker_fee=Decimal("0.0006"),
+    )
+    rows = make_messy_rows()
+    engine = GridEngine(
+        adapter=adapter, instrument=INSTRUMENT, direction="long", grid_rows=rows,
+        max_open_grid_orders=3, contract_spec=make_spec_with_step(),
+    )
+    await engine.start_laddering()
+    await fill_rounded(adapter, engine, rows, 0, Decimal("0.003"))
+    await fill_rounded(adapter, engine, rows, 1, Decimal("0.002"))
+    await fill_rounded(adapter, engine, rows, 2, Decimal("0.002"))
+    assert engine.open_qty == Decimal("0.007")
+
+    triggered = await engine.maybe_hybrid_reset(rows[2].avg_price)
+
+    assert triggered is True
+    assert [o.qty for o in adapter.market_requests] == [Decimal("0.003")]
+    assert engine.open_qty == Decimal("0.004")
+
+
+@pytest.mark.asyncio
+async def test_order_below_min_qty_after_rounding_raises_instead_of_placing():
+    """반올림 후 최소 주문 수량에 미달하면 애매한 주문을 내보내지 않고 명확히 실패한다
+    (거래소가 조용히 거부하게 두지 않는다 — SPEC 0번)."""
+    adapter = _RecordingAdapter(
+        instrument=INSTRUMENT, contract_spec=make_spec_with_step(), initial_equity=Decimal("10000"),
+        leverage=Decimal("20"), maker_fee=Decimal("0.0002"), taker_fee=Decimal("0.0006"),
+    )
+    rows = [make_row(0, 1, Decimal("64000"), Decimal("64000"), Decimal("64640"), Decimal("62080"),
+                     step_qty=Decimal("0.0009"))]  # 내리면 0 -> min_qty(0.001) 미달
+    engine = GridEngine(
+        adapter=adapter, instrument=INSTRUMENT, direction="long", grid_rows=rows,
+        max_open_grid_orders=1, contract_spec=make_spec_with_step(),
+    )
+
+    with pytest.raises(OrderQtyTooSmallError):
+        await engine.start_laddering()
+
+    assert adapter.limit_requests == []
+
+
+@pytest.mark.asyncio
+async def test_no_contract_spec_keeps_raw_quantities_backward_compatible():
+    """contract_spec을 안 넘기면(기존 호출부 전부) 반올림하지 않고 기존 동작 그대로."""
+    adapter = _RecordingAdapter(
+        instrument=INSTRUMENT, contract_spec=make_spec(), initial_equity=Decimal("10000"),
+        leverage=Decimal("20"), maker_fee=Decimal("0.0002"), taker_fee=Decimal("0.0006"),
+    )
+    rows = make_messy_rows()
+    engine = GridEngine(
+        adapter=adapter, instrument=INSTRUMENT, direction="long", grid_rows=rows,
+        max_open_grid_orders=1,
+    )
+
+    await engine.start_laddering()
+
+    assert adapter.limit_requests[0].qty == rows[0].step_qty
 
 
 @pytest.mark.asyncio
