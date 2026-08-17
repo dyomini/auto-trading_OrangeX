@@ -152,6 +152,13 @@ class ExchangeAdapter(ABC):
     @abstractmethod
     async def get_ticker(self, instrument: str) -> Ticker: ...
 
+    async def aclose(self) -> None:
+        """이 어댑터가 **직접 만들어 소유한** 자원을 정리한다. 기본은 no-op이라
+        `PaperAdapter`처럼 정리할 게 없는 구현은 아무것도 안 해도 된다(abstract가
+        아닌 이유). `direction="auto"`처럼 사이클마다 어댑터를 새로 만드는 경로에서
+        이전 어댑터의 WS 연결이 새지 않도록 호출한다."""
+        return None
+
     @abstractmethod
     async def set_leverage(self, instrument: str, leverage: Decimal) -> None: ...
 

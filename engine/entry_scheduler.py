@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from decimal import Decimal
+from enum import Enum
 from typing import Optional
 
 import httpx
@@ -34,6 +35,19 @@ _RSI_PERIOD = 14
 _DEFAULT_POLL_INTERVAL_SECONDS = 3600
 
 
+class EntryMode(Enum):
+    """SCOUTING에서 LADDERING으로 넘어가는 조건.
+
+    2026-08-17에 `manual_mode`에서 분리했다. 예전엔 "RSI를 건너뛴다"를 `manual_mode`로
+    표현했는데, `manual_mode`는 `GridEngine`에서 **TP 재등록과 hybrid reset까지** 끄는
+    플래그다. `DIRECTION=auto`는 RSI 게이트는 필요 없지만 TP는 반드시 켜야 해서
+    (방향 결정 자체가 이미 RSI로 끝났으므로 기다릴 것이 없다) 두 개념을 갈랐다.
+    """
+
+    RSI_GATED = "rsi_gated"   # SPEC 90줄: 일봉 RSI ≤30/≥70을 통과할 때까지 SCOUTING 유지
+    IMMEDIATE = "immediate"   # 게이트 없이 IDLE -> SCOUTING -> LADDERING 즉시 진행
+
+
 class EntryScheduler:
     """IDLE 상태의 GridEngine을 SCOUTING으로 전이시키고, SCOUTING인 동안 주기적으로
     완결된 일봉 RSI를 확인해 진입 필터를 통과하면 engine.start_laddering()을 호출한다."""
@@ -45,14 +59,14 @@ class EntryScheduler:
         direction: str,
         poll_interval_seconds: int = _DEFAULT_POLL_INTERVAL_SECONDS,
         http_client: Optional[httpx.AsyncClient] = None,
-        manual_mode: bool = False,
+        entry_mode: EntryMode = EntryMode.RSI_GATED,
     ) -> None:
         self.engine = engine
         self.instrument = instrument
         self.direction = direction
         self.poll_interval_seconds = poll_interval_seconds
         self._http_client = http_client
-        self.manual_mode = manual_mode
+        self.entry_mode = entry_mode
         self.last_rsi: Optional[Decimal] = None
 
     async def run(self) -> None:
@@ -67,8 +81,8 @@ class EntryScheduler:
             if self.engine.state == EngineState.IDLE:
                 await self.engine.start_scouting()
             if self.engine.state == EngineState.SCOUTING:
-                if self.manual_mode:
-                    logger.info("manual_mode — RSI 진입 필터 건너뛰고 즉시 LADDERING 시작")
+                if self.entry_mode is EntryMode.IMMEDIATE:
+                    logger.info("진입 게이트 없음(EntryMode.IMMEDIATE) — 즉시 LADDERING 시작")
                     await self.engine.start_laddering()
                 else:
                     await self.check_once()

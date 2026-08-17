@@ -843,3 +843,40 @@ async def test_watch_fills_raises_when_data_is_not_a_list():
 
     with pytest.raises(OrangeXResponseSchemaError):
         [fill async for fill in adapter.watch_fills(INSTRUMENT)]
+
+
+@pytest.mark.asyncio
+async def test_aclose_closes_ws_client_but_not_shared_rest_client():
+    """REST 클라이언트는 방향/사이클 간 공유되므로 어댑터가 닫으면 안 된다
+    (2026-08-17, direction="auto"에서 사이클마다 어댑터를 새로 만들면서 필요해짐)."""
+
+    class _SpyWs:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class _SpyRest:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+        async def call(self, method, params=None, authed=True):  # pragma: no cover
+            raise AssertionError("이 테스트에서는 호출되지 않는다")
+
+    ws, rest = _SpyWs(), _SpyRest()
+    adapter = OrangeXAdapter(rest, ws_client=ws)
+
+    await adapter.aclose()
+
+    assert ws.closed is True
+    assert rest.closed is False
+
+
+@pytest.mark.asyncio
+async def test_aclose_without_ws_client_is_noop():
+    adapter = OrangeXAdapter(FakeClient({}))
+    await adapter.aclose()  # 예외 없이 통과해야 함

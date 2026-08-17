@@ -36,7 +36,7 @@ import httpx
 
 from config.settings import Settings
 from engine.cycle_manager import CycleManager
-from engine.entry_scheduler import EntryScheduler
+from engine.entry_scheduler import EntryMode, EntryScheduler
 from engine.fill_router import FillRouter
 from engine.grid_engine import EngineHaltedError, GridEngine
 from engine.grid_setup import (
@@ -85,6 +85,15 @@ async def _price_watch_loop(
         await asyncio.sleep(settings.price_poll_interval_seconds)
 
 
+def _entry_mode_for(settings: Settings) -> EntryMode:
+    """진입 게이트 방식 결정. `manual_mode`는 청산 자동화를 끄는 플래그지 진입 게이트가
+    아니지만, 그 모드에서는 RSI를 기다릴 이유가 없어 즉시 진입으로 매핑한다
+    (2026-08-17 EntryMode 분리 이전의 동작을 그대로 보존)."""
+    if settings.manual_mode:
+        return EntryMode.IMMEDIATE
+    return EntryMode.RSI_GATED
+
+
 def _derive_halt_flag_path(base_path: str, direction: str) -> str:
     """direction="both"에서 롱/숏이 halt flag 파일을 공유하면 한쪽만 halted여도 다른
     멀쩡한 쪽까지 재시작을 못 하게 막아버린다 — 방향별로 별도 파일을 쓰도록 경로를
@@ -100,6 +109,7 @@ async def _run_single_direction(
     execution_adapter: Optional[ExchangeAdapter] = None,
     binance_http_client: Optional[httpx.AsyncClient] = None,
     on_engine_ready: Optional[Callable[[GridEngine], None]] = None,
+    entry_mode: Optional[EntryMode] = None,
 ) -> None:
     """방향 하나(`settings.direction`이 "long" 또는 "short")의 엔진 스택 전체를 조립해서
     계속 돌린다. 원래 `run()`의 본문이었으나, direction="both" 지원을 위해 `run()`이
@@ -153,7 +163,7 @@ async def _run_single_direction(
         direction=settings.direction,
         poll_interval_seconds=settings.rsi_poll_interval_seconds,
         http_client=binance_http_client,
-        manual_mode=settings.manual_mode,
+        entry_mode=entry_mode if entry_mode is not None else _entry_mode_for(settings),
     )
     cycle_manager = CycleManager(
         engine=engine,

@@ -386,6 +386,15 @@ class OrangeXAdapter(ExchangeAdapter):
             orders = [o for o in orders if o.get("position_side") == expected_side]
         return [self._parse_order_result(o, o.get("custom_order_id", "")) for o in orders]
 
+    async def aclose(self) -> None:
+        """이 어댑터가 소유한 WS 연결만 닫는다.
+
+        **REST `OrangeXClient`는 절대 닫지 않는다** — 계정 전체 레이트리밋(10 req/s)을
+        지키려고 방향/사이클을 넘나들며 공유되는 객체라, 수명은 만든 쪽(main.py)이
+        관리한다. 여기서 닫으면 다른 방향의 어댑터가 같이 죽는다."""
+        if self._ws_client is not None:
+            await self._ws_client.close()
+
     def watch_fills(self, instrument: str) -> AsyncIterator[Fill]:
         if self._ws_client is None:
             raise RuntimeError(

@@ -101,6 +101,10 @@ class OrangeXWsClient:
             self._reader_task.cancel()
         if self._transport is not None and self._owns_transport:
             await self._transport.close()
+        # 토큰을 비워 `is_connected`가 닫힌 뒤에도 True로 남지 않게 한다 — 안 그러면
+        # 닫힌 클라이언트를 실수로 재사용할 때 connect()를 건너뛰고 조용히 실패한다
+        # (사이클마다 어댑터를 새로 만드는 direction="auto"에서 실제로 위험해졌다).
+        self._access_token = None
 
     async def subscribe(self, channels: list[str]) -> list[str]:
         """`/private/subscribe`. 반환값은 실제로 구독된 채널 목록(요청과 다를 수 있음

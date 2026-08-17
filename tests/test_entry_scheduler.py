@@ -14,7 +14,7 @@ from decimal import Decimal
 import httpx
 import pytest
 
-from engine.entry_scheduler import EntryScheduler
+from engine.entry_scheduler import EntryMode, EntryScheduler
 from engine.grid_engine import EngineState, GridEngine
 from exchange.base import ContractSpec
 from exchange.paper import PaperAdapter
@@ -155,18 +155,18 @@ async def test_run_transitions_idle_to_scouting_then_laddering_on_pass():
 
 
 @pytest.mark.asyncio
-async def test_run_manual_mode_skips_rsi_and_ladders_immediately():
-    """manual_mode에서는 RSI 확인 자체를 안 해야 한다 — 호출되면 예외를 던지는
-    핸들러로 확인한다(바이낸스 API가 호출조차 안 됐다는 걸 실패로 검증)."""
+async def test_run_immediate_mode_skips_rsi_and_ladders_immediately():
+    """EntryMode.IMMEDIATE에서는 RSI 확인 자체를 안 해야 한다 — 호출되면 예외를
+    던지는 핸들러로 확인한다(바이낸스 API가 호출조차 안 됐다는 걸 실패로 검증)."""
     def handler(request: httpx.Request) -> httpx.Response:
-        raise AssertionError("manual_mode에서는 RSI 캔들 조회가 호출되면 안 됨")
+        raise AssertionError("IMMEDIATE 모드에서는 RSI 캔들 조회가 호출되면 안 됨")
 
     client = make_mock_client(handler)
     engine = make_engine()
     assert engine.state == EngineState.IDLE
     scheduler = EntryScheduler(
         engine=engine, instrument=INSTRUMENT, direction="long",
-        poll_interval_seconds=3600, http_client=client, manual_mode=True,
+        poll_interval_seconds=3600, http_client=client, entry_mode=EntryMode.IMMEDIATE,
     )
 
     task = asyncio.create_task(scheduler.run())
@@ -221,6 +221,47 @@ async def test_run_reenters_scouting_after_engine_reset_to_idle():
             await asyncio.sleep(0)
         assert engine.state == EngineState.LADDERING  # 2차 사이클도 재진입 성공
         assert engine.resting_grid_order_ids
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_immediate_mode_still_registers_tp_on_fill():
+    """이 테스트가 요구사항을 고정한다: 진입 게이트를 끄더라도 TP 자동 재등록은
+    반드시 살아 있어야 한다. 예전처럼 manual_mode로 게이트를 껐다면 TP까지 같이
+    꺼져서 이 테스트가 실패한다(그게 EntryMode를 분리한 이유다)."""
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("IMMEDIATE 모드에서는 RSI 캔들 조회가 호출되면 안 됨")
+
+    client = make_mock_client(handler)
+    engine = make_engine()
+    assert engine.manual_mode is False  # TP/hybrid reset은 켜져 있어야 한다
+    scheduler = EntryScheduler(
+        engine=engine, instrument=INSTRUMENT, direction="long",
+        poll_interval_seconds=3600, http_client=client, entry_mode=EntryMode.IMMEDIATE,
+    )
+
+    task = asyncio.create_task(scheduler.run())
+    try:
+        for _ in range(200):
+            if engine.state == EngineState.LADDERING:
+                break
+            await asyncio.sleep(0)
+        assert engine.state == EngineState.LADDERING
+
+        # 첫 격자 주문을 실제로 체결시켜 TP가 걸리는지 확인
+        index = min(engine.resting_grid_order_ids)
+        row = engine.grid_rows[index]
+        await engine.adapter.fill_order(
+            engine.resting_grid_order_ids[index], qty=row.step_qty, price=row.entry_price
+        )
+        await engine.adapter.on_price_tick(row.entry_price)
+        await engine.on_fill(index)
+
+        assert engine.tp_order_id is not None
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):

@@ -263,3 +263,13 @@ async def test_get_balance_reflects_used_margin():
     expected_equity = Decimal("10000") - fee
     assert balance.equity == expected_equity
     assert balance.available == expected_equity - used_margin
+
+
+@pytest.mark.asyncio
+async def test_aclose_is_noop():
+    """PaperAdapter는 정리할 자원이 없다 — ExchangeAdapter의 기본 no-op을 그대로 쓴다."""
+    adapter = make_adapter()
+    await adapter.aclose()
+    # 닫은 뒤에도 계속 쓸 수 있어야 한다(no-op이므로)
+    await adapter.on_price_tick(Decimal("64000"))
+    assert (await adapter.get_ticker(INSTRUMENT)).last_price == Decimal("64000")
