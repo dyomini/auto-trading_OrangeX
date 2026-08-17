@@ -49,6 +49,10 @@ class Settings(BaseSettings):
     # 청산가 사이의 완충(3k 프리셋 기준 약 2%p)이 유일한 방어선이 된다.
     sl_enabled: bool = True
     daily_loss_limit_pct: Optional[Decimal] = None
+    # DIRECTION=both 전용(2026-08-17 사용자 결정): 롱/숏 **합산** 미실현손익이 투입
+    # 증거금 합계 대비 이 비율에 도달하면 양쪽을 전량 청산하고 즉시 재진입한다.
+    # 수수료(진입 maker + 청산 taker)를 차감한 실현 가능한 수익률로 판정한다.
+    combined_tp_roe: Decimal = Decimal("0.10")
     cooldown_minutes: int = 30
     max_open_grid_orders: int = 5
     # docs/phase2-report.md §1 라이브 확정치 (Phase 1의 taker=0.05% 가정을 대체)

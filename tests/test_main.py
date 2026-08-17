@@ -606,3 +606,106 @@ async def test_run_fixed_direction_still_resets_in_place():
         with pytest.raises(asyncio.CancelledError):
             await task
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_run_both_forces_manual_mode_so_no_individual_tp(tmp_path):
+    """합산 모드에서는 개별 TP를 걸지 않는다 — 청산 권한이 CombinedPnlMonitor 하나로
+    단일화돼야 합산 손익 계산이 모호해지지 않는다."""
+    settings = make_settings(
+        direction="both", equity_usdt=Decimal("20000"), max_open_grid_orders=1,
+        price_poll_interval_seconds=0, halt_flag_path=str(tmp_path / "halted.json"),
+    )
+    market_data_adapter = make_market_data_adapter(last_price="64000")
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("합산 모드는 RSI 캔들을 조회하지 않는다")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    ready: list = []
+    task = asyncio.create_task(
+        run(settings, market_data_adapter=market_data_adapter,
+            binance_http_client=client, on_engine_ready=ready.append)
+    )
+    try:
+        for _ in range(5000):
+            if len(ready) >= 2 and all(e.open_qty > 0 for e in ready[:2]):
+                break
+            await asyncio.sleep(0)
+        assert len(ready) >= 2
+        assert {e.direction for e in ready[:2]} == {"long", "short"}
+        for engine in ready[:2]:
+            assert engine.manual_mode is True
+            assert engine.tp_order_id is None, "개별 TP가 걸렸다"
+            assert engine.sl_order_id is None
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_run_both_closes_and_rebuilds_when_combined_target_reached(tmp_path):
+    """합산 목표 도달 -> 양쪽 청산 -> 즉시 재진입까지의 배선 e2e.
+
+    합산 손익 계산 자체는 tests/test_combined_pnl_monitor.py가 검증한다. 여기서는
+    "모니터가 발동하면 스택이 실제로 다시 조립되는지"만 본다. 롱/숏이 같은 크기면
+    합산 손익이 구조적으로 0이라 발동하지 않으므로, 숏 쪽 보유량을 0으로 만들어
+    비대칭을 인위적으로 만든다(가격은 격자 한 칸 미만으로만 움직여 다른 단계가
+    체결되지 않게 한다)."""
+    settings = make_settings(
+        direction="both", equity_usdt=Decimal("20000"), max_open_grid_orders=1,
+        price_poll_interval_seconds=0, combined_tp_roe=Decimal("0.005"),
+        maker_fee=Decimal("0"), taker_fee=Decimal("0"),
+        halt_flag_path=str(tmp_path / "halted.json"),
+    )
+    ticker_client = FakeOrangeXClient({
+        "/public/get_instruments": {"instruments": [{
+            "instrument_name": INSTRUMENT, "tick_size": "50", "min_qty": "0.001",
+            "min_notional": "10", "contract_size": "1",
+        }]},
+        "/public/ticker": {"last_price": "64000"},
+    })
+    market_data_adapter = OrangeXAdapter(ticker_client)
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("합산 모드는 RSI 캔들을 조회하지 않는다")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    ready: list = []
+    task = asyncio.create_task(
+        run(settings, market_data_adapter=market_data_adapter,
+            binance_http_client=client, on_engine_ready=ready.append)
+    )
+    try:
+        for _ in range(5000):
+            if len(ready) >= 2 and all(e.open_qty > 0 for e in ready[:2]):
+                break
+            await asyncio.sleep(0)
+        assert len(ready) >= 2, "양방향 스택이 조립되지 않음"
+        short_engine = next(e for e in ready[:2] if e.direction == "short")
+        # 엔진 필드만 건드리면 거래소(PaperAdapter) 포지션과 어긋나 _assert_cycle_closed_out이
+        # 정확히 그걸 잡아낸다 — 실제 API로 청산해서 양쪽을 일치시킨다.
+        await short_engine.close_all_and_cooldown()
+        assert short_engine.open_qty == Decimal("0")
+
+        # 격자 한 칸(50)보다 작게 올려서 다른 단계가 체결되지 않게 한다
+        ticker_client.responses["/public/ticker"] = {"last_price": "64040"}
+
+        for _ in range(20000):
+            if len(ready) >= 4:
+                break
+            await asyncio.sleep(0)
+
+        assert len(ready) >= 4, "합산 익절 후 스택이 재조립되지 않음"
+        assert {e.direction for e in ready[2:4]} == {"long", "short"}
+        assert ready[2] is not ready[0] and ready[3] is not ready[1]
+        # 새 사이클은 청산 시점의 현재가로 격자를 다시 깐다
+        new_long = next(e for e in ready[2:4] if e.direction == "long")
+        assert new_long.grid_rows[0].entry_price == Decimal("64040")
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await client.aclose()

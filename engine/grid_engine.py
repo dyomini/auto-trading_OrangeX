@@ -344,6 +344,45 @@ class GridEngine:
             await self._reregister_sl(row)
         return True
 
+    async def close_all_and_cooldown(self) -> Decimal:
+        """보유 물량 전량을 시장가로 청산하고 COOLDOWN으로 보낸다. 청산한 수량을 반환한다.
+
+        `on_tp_filled()`의 정리 로직(잔여 주문 취소 + open_qty=0 + COOLDOWN)과 같지만
+        **시장가 청산까지 직접 수행**하고, `_force_close_and_halt()`와 달리 `halted`를
+        세우지 않는다 — 이건 사고가 아니라 정상적인 사이클 종료다.
+
+        `DIRECTION=both`(합산 손익 익절)에서 `engine/combined_pnl_monitor.py`가 호출한다.
+        잔여 격자 주문을 **먼저** 취소하는 이유: 청산 중에 그 주문이 체결되면 방금 닫은
+        포지션이 다시 열린다."""
+        self._check_not_halted()
+        self.state = EngineState.CLOSING
+
+        for order_id in list(self.resting_grid_order_ids.values()):
+            await self.adapter.cancel_order(order_id)
+        self.resting_grid_order_ids.clear()
+        for attr in ("tp_order_id", "sl_order_id"):
+            order_id = getattr(self, attr)
+            if order_id is not None:
+                await self.adapter.cancel_order(order_id)
+                setattr(self, attr, None)
+
+        closed = Decimal("0")
+        if self.open_qty > 0:
+            closed = self._closing_qty(self.open_qty)
+            if closed > 0:
+                await self.adapter.place_market_order(
+                    MarketOrderRequest(
+                        instrument=self.instrument,
+                        side=self._exit_side(),
+                        qty=closed,
+                        client_order_id=f"closeall-{self.filled_step_count}-{uuid.uuid4().hex[:8]}",
+                        reduce_only=True,
+                    )
+                )
+        self.open_qty = Decimal("0")
+        self.state = EngineState.COOLDOWN
+        return closed
+
     async def on_tp_filled(self) -> None:
         """TP 주문이 체결돼 포지션이 전량 청산됐을 때 호출한다."""
         self.state = EngineState.CLOSING

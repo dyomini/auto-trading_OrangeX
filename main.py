@@ -35,6 +35,7 @@ from typing import Callable, Optional
 import httpx
 
 from config.settings import Settings
+from engine.combined_pnl_monitor import CombinedPnlMonitor
 from engine.cycle_manager import CycleManager, CycleOutcome, CycleRestartPolicy
 from engine.direction_selector import decide_direction_with_retry
 from engine.entry_scheduler import EntryMode, EntryScheduler
@@ -372,6 +373,116 @@ async def _run_auto_direction(
             await shared_client.aclose()
 
 
+async def _run_both_combined(
+    settings: Settings,
+    market_data_adapter: OrangeXAdapter,
+    contract_spec: ContractSpec,
+    binance_http_client: Optional[httpx.AsyncClient] = None,
+    on_engine_ready: Optional[Callable[[GridEngine], None]] = None,
+) -> None:
+    """`DIRECTION=both` — 롱/숏을 동시에 깔아두고, **합산 손익이 투입 증거금 대비
+    `combined_tp_roe`(기본 10%)에 도달하면 양쪽을 전량 청산**한 뒤 즉시 재진입한다
+    (2026-08-17 사용자 결정으로 기존 "독립된 두 봇" 의미를 교체함).
+
+    개별 TP/SL/hybrid reset은 전부 끈다(`manual_mode=True`로 하위 스택을 구성) —
+    청산 권한을 `CombinedPnlMonitor` 하나로 단일화해야 합산 손익 계산이 모호해지지
+    않는다(부분청산이 실현손익을 만들면 미실현 기준 계산과 어긋난다).
+
+    `equity_usdt`는 반씩 나눠 쓴다 — 최소 시드가 단방향의 2배 필요하다.
+    COOLDOWN 대기는 없다(사용자 요청: 즉시 재진입)."""
+    shared_client = _build_shared_rest_client(settings)
+    half_equity = settings.equity_usdt / 2
+
+    def _side_settings(direction: str) -> Settings:
+        return settings.model_copy(update={
+            "direction": direction,
+            "equity_usdt": half_equity,
+            # 개별 청산 자동화를 전부 끈다 — 청산은 CombinedPnlMonitor 전담.
+            "manual_mode": True,
+            # halt flag는 방향별로 분리한다: 한쪽 사고로 멀쩡한 쪽까지 재시작을
+            # 못 하게 막지 않기 위해(2026-08-04 기존 both에서 확립한 규칙 그대로).
+            "halt_flag_path": _derive_halt_flag_path(settings.halt_flag_path, direction),
+        })
+
+    try:
+        while True:
+            long_settings = _side_settings("long")
+            short_settings = _side_settings("short")
+            long_adapter = build_execution_adapter(long_settings, contract_spec, shared_client=shared_client)
+            short_adapter = build_execution_adapter(short_settings, contract_spec, shared_client=shared_client)
+
+            # 모니터와 공유하는 살아있는 dict — 각 스택이 조립되면서 자기 엔진을 등록한다.
+            engines: dict[str, GridEngine] = {}
+
+            def _register(direction: str):
+                def hook(engine: GridEngine) -> None:
+                    engines[direction] = engine
+                    if on_engine_ready is not None:
+                        on_engine_ready(engine)
+                return hook
+
+            monitor = CombinedPnlMonitor(
+                engines=engines,
+                market_data_adapter=market_data_adapter,
+                settings=settings,
+                target_roe=settings.combined_tp_roe,
+                poll_interval_seconds=settings.price_poll_interval_seconds,
+            )
+
+            tasks = [
+                asyncio.create_task(
+                    _run_single_direction(
+                        long_settings, market_data_adapter, contract_spec, long_adapter,
+                        binance_http_client, _register("long"), entry_mode=EntryMode.IMMEDIATE,
+                    ),
+                    name="run-long",
+                ),
+                asyncio.create_task(
+                    _run_single_direction(
+                        short_settings, market_data_adapter, contract_spec, short_adapter,
+                        binance_http_client, _register("short"), entry_mode=EntryMode.IMMEDIATE,
+                    ),
+                    name="run-short",
+                ),
+                asyncio.create_task(monitor.run(), name="combined_pnl_monitor"),
+            ]
+
+            triggered = False
+            try:
+                done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    if task.cancelled():
+                        raise asyncio.CancelledError(f"{task.get_name()}가 외부에서 취소됨")
+                    exc = task.exception()
+                    if exc is not None:
+                        raise exc
+                if tasks[2] not in done:
+                    raise RuntimeError(
+                        "모니터가 아닌 태스크가 예외 없이 종료됨 — 원인을 추측하지 않고 정지한다: "
+                        + ", ".join(t.get_name() for t in done)
+                    )
+                triggered = True
+            finally:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                try:
+                    # 다음 사이클의 어댑터는 새로 만들어지므로, 청산이 실제로 끝났는지는
+                    # 지금 이 어댑터로만 확인할 수 있다(_run_auto_direction과 같은 이유).
+                    # 예외가 이미 전파 중일 땐 그걸 가리지 않도록 성공 경로에서만 검사한다.
+                    if triggered:
+                        await _assert_cycle_closed_out(long_adapter, settings.symbol, "long")
+                        await _assert_cycle_closed_out(short_adapter, settings.symbol, "short")
+                finally:
+                    await long_adapter.aclose()
+                    await short_adapter.aclose()
+
+            logger.info("합산 익절 완료 — 현재가 기준으로 양방향 격자를 즉시 다시 깐다")
+    finally:
+        if shared_client is not None:
+            await shared_client.aclose()
+
+
 async def run(
     settings: Settings,
     market_data_adapter: Optional[OrangeXAdapter] = None,
@@ -411,55 +522,9 @@ async def run(
 
     if execution_adapter is not None:
         raise ValueError('direction="both"에서는 execution_adapter를 미리 주입할 수 없음 — 방향별로 2개 필요')
-
-    half_equity = settings.equity_usdt / 2
-    long_settings = settings.model_copy(update={
-        "direction": "long",
-        "equity_usdt": half_equity,
-        "halt_flag_path": _derive_halt_flag_path(settings.halt_flag_path, "long"),
-    })
-    short_settings = settings.model_copy(update={
-        "direction": "short",
-        "equity_usdt": half_equity,
-        "halt_flag_path": _derive_halt_flag_path(settings.halt_flag_path, "short"),
-    })
-
-    # REST 클라이언트는 계정 전체 레이트리밋을 지키려고 공유(위 모듈 docstring 참고).
-    # paper 모드에서는 애초에 REST 호출이 없으니 None으로 둬도 build_execution_adapter가
-    # 그냥 무시한다.
-    shared_client: Optional[OrangeXClient] = None
-    if settings.trading_mode == "live":
-        # auth_grant_type 명시 필요 — engine/grid_setup.py의 build_execution_adapter()
-        # 모듈 docstring 참고(2026-08-06 실전 사고: 기본값 client_signature는 이 프로젝트
-        # 에서 안정적으로 성공한 적이 없음).
-        shared_client = OrangeXClient(
-            client_id=settings.api_key.get_secret_value(),
-            client_secret=settings.api_secret.get_secret_value(),
-            auth_grant_type="client_credentials",
-        )
-    long_adapter = build_execution_adapter(long_settings, contract_spec, shared_client=shared_client)
-    short_adapter = build_execution_adapter(short_settings, contract_spec, shared_client=shared_client)
-
-    both_tasks = [
-        asyncio.create_task(
-            _run_single_direction(long_settings, market_data_adapter, contract_spec, long_adapter, binance_http_client, on_engine_ready),
-            name="run-long",
-        ),
-        asyncio.create_task(
-            _run_single_direction(short_settings, market_data_adapter, contract_spec, short_adapter, binance_http_client, on_engine_ready),
-            name="run-short",
-        ),
-    ]
-    try:
-        done, _pending = await asyncio.wait(both_tasks, return_when=asyncio.FIRST_EXCEPTION)
-        for task in done:
-            exc = task.exception()
-            if exc is not None:
-                raise exc
-    finally:
-        for task in both_tasks:
-            task.cancel()
-        await asyncio.gather(*both_tasks, return_exceptions=True)
+    await _run_both_combined(
+        settings, market_data_adapter, contract_spec, binance_http_client, on_engine_ready
+    )
 
 
 def main() -> None:
