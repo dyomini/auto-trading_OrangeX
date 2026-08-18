@@ -49,7 +49,9 @@ strategy/     순수 계산 (거래소 무관) — grid, weights, targets, liqui
 exchange/     base.py(ExchangeAdapter 인터페이스, ContractSpec, round_qty_to_step)
               paper.py(인메모리 체결 시뮬레이터), orangex/(client, auth, ws_client, adapter)
 engine/       grid_engine(상태머신), fill_router, entry_scheduler, cycle_manager,
-              restart_recovery, grid_setup(공용 조립 로직), halt_flag
+              restart_recovery, grid_setup(공용 조립 로직), halt_flag,
+              direction_selector(15분봉 RSI 방향 판정), combined_pnl_monitor(both 합산 익절)
+config/       settings(.env 스키마), presets(3k/5k 프리셋), weights.csv
 main.py       메인 자동매매 봇 진입점 (위 조각들을 조립)
 quick_entry.py 즉시 진입 도구 — 격자 자동매매와 독립, 진입만 자동화(TP/SL은 사용자가 직접)
 launcher.py   대화형 메뉴 (봇 실행 / 즉시 진입 분기)
@@ -98,21 +100,37 @@ Phase 0~3 완료. paper 모드는 바로 쓸 수 있고, `quick_entry`는 실전
 (2026-08-05, 실제 order_id 확인). **`main.py` 전체를 `trading_mode=live`로 처음부터 끝까지
 기동해본 적은 아직 없다.**
 
-**[긴급] `engine/grid_engine.py`에 `qty_step` 반올림이 아직 적용 안 됐다.**
-`_refresh_grid_orders` / `_reregister_tp` / `_reregister_sl` / `_force_close_and_halt` /
-`maybe_hybrid_reset`이 미가공 수량을 그대로 주문에 넣는다 — **이 상태로 메인 봇을 라이브로 켜면
-모든 주문이 정밀도 불일치로 실패한다.** `GridEngine`이 `contract_spec`을 갖고 있지 않아
-생성자 / `build_recovered_engine` / `CycleManager`까지 함께 손봐야 한다. 메인 봇 실전 기동 전 필수.
+**2026-08-17 대규모 개편** (자세한 내역은 `docs/phase3-plan.md`):
+- `GRID_PRESET=3k|5k` — 현재가 기준 ±가격 범위 프리셋. **레버리지 40배 고정**이고
+  `MAX_STAGE`/`LEVERAGE`를 덮어쓴다. 최소 시드 3k≈548 / 5k≈2,656 USDT(both는 2배).
+- `DIRECTION=auto` — 사이클마다 **15분봉** RSI(14)로 방향 결정(≥50 숏, <50 롱).
+  방향이 바뀌면 어댑터 스택을 통째로 재조립한다(position_side가 생성 시 고정이라).
+- `DIRECTION=both` **재정의** — 양방향 동시 진입 + 롱/숏 **합산** 손익이 투입 증거금 대비
+  `COMBINED_TP_ROE`(기본 10%) 도달 시 양쪽 청산 후 즉시 재진입. 개별 TP/SL은 전부 꺼진다.
+- ATR 격자 확대 제거, `SL_ENABLED=false`로 SL 미등록 가능.
+- `engine/grid_engine.py`의 qty_step 미적용 블로커 **해소**(5개 주문 지점 + open_qty 누적).
+
+**SPEC 이탈 항목**(사용자 결정, `SPEC.md`는 원문이라 수정 안 함):
+일봉 RSI 30/70 게이트 → 15분봉 50 방향결정 / ATR 배제 / 4~5차 SL 필수 → 미등록 /
+both의 의미 변경. auto는 임계값이 50이라 **"아직 들어가지 마라"는 브레이크가 없다** —
+봇이 상시 포지션을 든다. SL도 안 걸면 격자 최심 주문가와 청산가 사이 완충
+(3k/40배 기준 약 2.08%p)이 유일한 방어선이다.
 
 **Phase 4(리스크 가드)는 전부 미구현이다.** `.env`의 `DAILY_LOSS_LIMIT_PCT`는 선언만 되고
 코드 어디서도 안 쓰이는 죽은 설정값이다(일일 손실 킬 스위치 없음). 청산가 근접 경보, 잔고 재검증,
 API 키 권한 확인, 가격 급변 방어도 전부 없다. SPEC에 "협상 불가"로 적혀 있지만 아직 안 됐다 —
 **사용자에게 "이미 다 안전하다"고 오해하게 만들지 마라.**
 
-알려진 실패 테스트 1건(187 passed / 1 failed):
-`tests/test_main.py::test_run_writes_halt_flag_when_engine_halts_via_fill_router` —
-`main.py`의 `asyncio.wait(FIRST_EXCEPTION)`이 5초 안에 안 깨져 `TimeoutError`. 이 테스트는
-완전히 모킹돼 있어 네트워크와 무관하다. 사용자 로컬은 Python 3.14다.
+**라이브 기동 전 남은 확인 2건**: (1) OrangeX 계좌의 실제 레버리지가 40배인지
+(`set_leverage()`는 봇 경로에서 호출된 적이 없다 — `settings.leverage`는 수량 계산용
+지역값일 뿐이다), (2) `get_open_orders()`의 `position_side` 필터링 라이브 검증
+(다른 엔드포인트 스키마로부터 유추한 것).
+
+테스트는 **257개 전부 통과**한다. 오랫동안 "Python 3.14 asyncio 문제"로 기록돼 있던
+실패 1건은 실제로는 테스트 격리 문제였다 — `Settings`가 kwargs로 안 넘긴 필드를 CWD의
+`.env`에서 읽어와 로컬 `MANUAL_MODE=TRUE`가 흘러들어간 것. `tests/conftest.py`가
+`.env` 로딩을 꺼서 차단한다. **테스트에서 `Settings`를 만들 땐 결과에 영향 주는 필드를
+명시적으로 넘겨라.**
 
 ## 작업 방식
 

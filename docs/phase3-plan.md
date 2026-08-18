@@ -435,18 +435,94 @@ SPEC.md Phase 3는 원래 "체결마다 TP 취소 후 재등록"과 "4~5차 진�
   - **교훈(다음에도 적용)**: "화면에 성공 메시지가 뜬다"는 라이브 검증의 증거가 될 수
     없다 — 반드시 거래소 응답의 원본 필드(이번엔 order_id 형식)까지 대조해야 한다.
 
+- **완료(2026-08-17, 대규모 개편)**: 사용자가 진입/청산 정책을 새로 정해서 그대로 반영했다.
+  SPEC에서 벗어나는 결정이 여럿이라 이탈 사유를 아래 남긴다(`SPEC.md`는 사용자 원문이라 수정 안 함).
+
+  **결정된 정책**
+  1. 진입 판단: 일봉 RSI(14) ≤30/≥70 **게이트** → **15분봉 RSI(14) 50 기준 방향 결정**
+     (≥50 숏, <50 롱). RSI가 "들어갈지"가 아니라 "어느 쪽으로 갈지"를 정한다. → `DIRECTION=auto`
+  2. ATR을 진입 근거에서 **완전 배제** (SPEC 90번의 "ATR 급등 시 격자 간격 확대" 제거).
+  3. **3k/5k 프리셋**을 설정에서 고르고 **레버리지 40배 고정**.
+  4. **SL 미등록** (`SL_ENABLED=false`).
+  5. `DIRECTION=both` **재정의**: 기존의 "독립된 두 봇"을 폐기하고, 양방향 동시 진입 후
+     **합산 손익이 투입 증거금 대비 10%면 양쪽 전량 청산 + 즉시 재진입**.
+
+  **SPEC 이탈 항목과 사유**
+  - Phase 3 "진입 조건 필터: 일봉 RSI(14) ≤30/≥70, ATR 급등 시 격자 간격 확대"
+    → auto/both 모드에서는 적용 안 함. ATR 배율/임계값(1.3/2.0)은 애초에 SPEC 근거 없이
+    이 구현이 정했던 값이라 삭제. `long`/`short` 고정 모드에서는 기존 게이트가 그대로 살아 있다.
+  - Phase 3 "4~5차 진입 시 SL 반드시 등록, 실패 시 전량 청산 후 정지"
+    → `SL_ENABLED=false`로 끌 수 있게 함. **끄면 격자 최심 주문가와 청산가 사이 완충이
+    유일한 방어선**이다(3k/40배 기준 약 2.08%p, 수수료 반영).
+  - **주의**: 임계값 50은 항상 어느 한쪽이 참이라 auto 모드에는 "아직 들어가지 마라"는
+    브레이크가 없다. 기존 30/70 게이트는 진입 자체를 자주 막았다 — 노출이 실질적으로 늘어난다.
+
+  **레버리지 40배를 고른 근거** (라이브 BTC 63,663 기준 계산, 사용자와 함께 확인)
+  처음엔 사용자가 "3k는 66배, 5k는 50배"를 제시했다. 계산해보니 그 값에서는 격자를 다
+  채웠을 때 청산가가 최심 주문가보다 **위**에 있었다. 다만 이건 `find_max_feasible_step`이
+  절삭하기 전의 가상 상태이고, 실제로 걸리는(절삭된) 격자 기준으로 다시 계산하면 청산이
+  먼저 오는 상황은 아니었다 — 실제 차이는 **완충 폭과 커버 범위**였다:
+
+  | 레버리지 | 3k 실사용 | 커버 범위 | 최심 주문가 | 그 상태 청산가 | 완충 |
+  |---|---|---|---|---|---|
+  | 66 | 47/60 | 2,300 | −3.61% | −4.62% | 1.00%p |
+  | 50 | 49/60 | 2,400 | −3.77% | −5.27% | 1.50%p |
+  | **40** | **50/60** | **2,450** | **−3.85%** | **−5.95%** | **2.08%p** |
+  | 20 | 54/60 | 2,650 | −4.16% | −8.71% | 4.55%p |
+
+  - **청산 거리는 시드 크기와 완전히 무관하다** — equity가 `cum_qty`와 청산가 공식 양쪽에서
+    약분된다. 시드 336~1,000,000 USDT까지 확인했고 전부 동일했다. 시드는 `min_trade_amount`
+    (0.001 BTC) 충족 여부에만 영향을 준다.
+  - 수수료(진입 maker 0.02%)의 청산가 영향은 +0.02%p로 무시할 수준.
+  - 최소 시드: 3k 약 548 / 5k 약 2,656 USDT (both는 각각 2배).
+
+  **구현 (커밋 8개)**
+  - `engine/grid_engine.py`: `contract_spec` 필드 + `_order_qty()`/`_closing_qty()`로 5개 주문
+    지점에 qty_step 내림 적용. `open_qty` 누적도 내림값으로. `sl_enabled` 필드.
+    `close_all_and_cooldown()` 신규(합산 익절용, halted를 세우지 않는 전량 청산).
+  - `engine/restart_recovery.py`: `rounded_cum_qty()`로 엔진과 동일 산술 사용,
+    `detect_open_direction()` 신규(auto 재시작 시 거래소 실제 상태로만 방향 판정).
+  - `config/presets.py` 신규 + `Settings.grid_preset` + `model_validator`로 max_stage/leverage 덮어쓰기.
+  - `strategy/market_data.py`: `fetch_candles(interval=...)`, `INTERVAL_TO_MS`,
+    `closed_candles(interval_ms=...)`.
+  - `engine/direction_selector.py` 신규: 15분봉 RSI 방향 판정 + 재시도. 데이터 부족 시
+    폴백 없이 `DirectionDecisionError`.
+  - `engine/entry_scheduler.py`: `EntryMode`(RSI_GATED/IMMEDIATE)로 `manual_mode`와 분리 —
+    manual_mode를 재사용하면 TP까지 꺼진다.
+  - `engine/cycle_manager.py`: `CycleRestartPolicy`/`CycleOutcome`, `run()`이 값을 반환.
+  - `engine/combined_pnl_monitor.py` 신규: 합산 ROE 계산(수수료 차감) + 양쪽 청산.
+  - `main.py`: `asyncio.wait`를 `FIRST_EXCEPTION` → `FIRST_COMPLETED`,
+    `_run_auto_direction()`/`_run_both_combined()`/`_assert_cycle_closed_out()`.
+  - `exchange/base.py` no-op `aclose()`, `OrangeXAdapter.aclose()`(WS만 닫음),
+    `OrangeXWsClient.close()`가 토큰을 비우도록 수정.
+
+  **부수적으로 잡은 것 2건**
+  1. **`asyncio.wait(FIRST_EXCEPTION)`의 잠재적 행(hang)**: 네 태스크 중 하나가 예외 없이
+     정상 종료하면 `ALL_COMPLETED`로 degrade해서, FillRouter가 죽은 채 포지션을 든 상태로
+     영원히 대기하게 된다. `FIRST_COMPLETED` + 예상 밖 정상 종료 시 `RuntimeError`로 바꿨다.
+  2. **"알려진 실패 테스트 1건"의 진짜 원인** — 오랫동안 "Python 3.14의 asyncio 문제"로
+     기록돼 있던 `test_run_writes_halt_flag_when_engine_halts_via_fill_router`는 asyncio와
+     무관했다. `Settings`가 kwargs로 안 넘긴 필드를 CWD의 `.env`에서 읽어오는데, 로컬
+     `.env`의 `MANUAL_MODE=TRUE`가 테스트로 흘러들어와 엔진이 SL 등록을 통째로 건너뛰었고,
+     그래서 `EngineHaltedError`가 아예 발생하지 않아 `wait_for`가 타임아웃한 것이었다.
+     `tests/conftest.py`에서 `.env` 로딩 자체를 끄도록 해 같은 유형을 원천 차단했다.
+     **전체 스위트 187 passed/1 failed → 257 passed / 0 failed.**
+
+  **paper end-to-end 검증 완료(실제 시세)**
+  - auto: 15분봉 RSI 68.59 → SHORT 판정, 프리셋 3k→max_stage 3/leverage 40, 실사용 50단계,
+    격자가 현재가 위쪽(63,603→66,053), TP 자동 등록, SL 미등록,
+    **주문 수량이 `0.00264137653451398671` → `0.002`로 깔끔하게 내림됨**(qty_step 수정 확인).
+  - both: 롱/숏 두 스택 동시 조립(각 1,500 USDT), 롱은 아래·숏은 위로 격자,
+    개별 TP/SL 전부 None, 합산 ROE가 매 폴링마다 로그(진입 직후 −3.20% = 왕복 수수료분).
+
+  **아직 안 한 것**: 라이브 기동은 여전히 없다. 아래 "아직 만들지 않은 것" 참고.
+
 ## 아직 만들지 않은 것 (다음 작업)
-- **[긴급/안전] `engine/grid_engine.py`에 수량 정밀도(qty_step) 반올림 적용**: quick_entry.py는
-  2026-08-06에 고쳤지만(`round_qty_to_step()`, `exchange/base.py`), 메인 자동매매 봇
-  (`_refresh_grid_orders`/`_reregister_tp`/`_reregister_sl`/`_force_close_and_halt`/
-  `maybe_hybrid_reset` — `engine/grid_engine.py`)은 여전히 `compute_grid()`의 미가공
-  수량을 그대로 주문에 넣는다. **지금 상태로 메인 봇을 라이브로 켜면 모든 주문이 거래소
-  정밀도 불일치로 실패할 것**(quick_entry가 겪은 것과 동일 원인). `GridEngine`이 `contract_
-  spec`(또는 최소 `qty_step`)을 갖고 있지 않아 생성자/`build_recovered_engine`/`CycleManager`
-  까지 함께 손봐야 하는 더 큰 변경 — 메인 봇을 라이브로 켜기 전 반드시 먼저 처리할 것.
 - **최소 주문 미달 단계 병합 로직 실제 구현**: 정책은 이미 결정됐음(docs/phase1-report.md: 다음 단계에 합산). 병합하려면 `compute_grid()`의 누적 계산(cum_qty/avg_price/liq_price/TP/SL이 전부 이전 단계에 순차적으로 의존)을 병합 인식형으로 다시 짜야 하는데, 이건 골든 테스트(`tests/test_golden.py`, 엑셀 원본 대조)가 지키는 핵심 재무 계산이라 서둘러 손대면 실제 계산 오류를 만들 위험이 크다. default 설정에서는 이 상황 자체가 발생 안 함을 확인했고 지금은 안전하게 시작을 거부만 하므로, 실제로 이 상황이 발생하는 설정을 쓰게 될 때 제대로 다시 설계해서 구현하는 게 낫다고 판단해 미룸.
 - **`engine/restart_recovery.py`를 OrangeX 라이브로 실제 기동해서 끝까지 검증**: `get_open_orders()` 블로커는 풀렸지만, 이 모듈이 라이브 데이터로 실제로 상태를 정확히 재구성하는지는 아직 실전 확인 전.
 - **`main.py`를 `trading_mode=live`로 실제 기동**: 지금까지는 전부 개별 조각(watch_fills, place_market_order, get_open_orders 등)을 따로따로 라이브 검증했다 — `main.py` 전체를 live 모드로 처음부터 끝까지 돌려본 적은 없음.
+- **거래소 실제 레버리지 확인(라이브 전 필수)**: `set_leverage()`는 어댑터에 있지만 봇 경로에서 한 번도 호출되지 않는다. `settings.leverage`(프리셋이 정하는 40배)는 순수 수량 계산용 지역값일 뿐이라, OrangeX 계좌의 실제 레버리지가 40배가 아니면 실제 증거금이 계산과 어긋난다. 상태 변경 호출이라 사용자 승인 전엔 실행 안 함(SPEC 3번).
+- **`get_open_orders()`의 `position_side` 필터링 라이브 검증**: 이 필드가 그 엔드포인트 응답에 있다는 건 다른 엔드포인트에서 관찰된 스키마로부터 **유추**한 것이다(`exchange/orangex/adapter.py`). `direction=auto`의 `detect_open_direction()`과 `_assert_cycle_closed_out()`이 부분적으로 여기 기댄다 — 둘 다 라이브 검증된 `get_position()`을 1차 근거로 삼고 주문 조회는 보조 신호로만 써서 보수적으로(거부 쪽으로만) 작동하게 해뒀지만, 라이브로 켜기 전 확인이 필요하다.
 
 ## 미해결 항목
 
