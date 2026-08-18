@@ -109,6 +109,23 @@ def _derive_halt_flag_path(base_path: str, direction: str) -> str:
     return str(p.with_stem(f"{p.stem}_{direction}"))
 
 
+def _warn_if_mandatory_sl_unreachable(settings: Settings) -> None:
+    """`mandatory_sl_min_tier`가 `max_stage`보다 크면 `major_tier`가 그 값에 절대 도달하지
+    못해 필수 SL이 **영원히 등록되지 않는다**(2026-08-04에 한 번 사고가 났던 문제).
+    SL을 껐다면 애초에 등록 자체를 안 하므로 해당 없다.
+
+    2026-08-18에 tier가 1개뿐인 1k 프리셋을 추가하면서 다시 눈에 띄게 됐다 — 기본
+    `.env`(MANDATORY_SL_MIN_TIER=3)에 1k를 얹으면 바로 이 상황이 된다. 조용히 시작해서
+    "SL이 걸려 있다"고 오해하게 두지 않고 명시적으로 경고한다."""
+    if settings.sl_enabled and settings.mandatory_sl_min_tier > settings.max_stage:
+        logger.warning(
+            "MANDATORY_SL_MIN_TIER=%d가 max_stage=%d보다 커서 필수 SL이 영원히 등록되지 "
+            "않는다(major_tier가 그 값에 도달 못 함). SL을 쓰려면 MANDATORY_SL_MIN_TIER를 "
+            "%d 이하로 낮춰라 — 지금 상태는 SL_ENABLED=false와 사실상 같다.",
+            settings.mandatory_sl_min_tier, settings.max_stage, settings.max_stage,
+        )
+
+
 async def _run_single_direction(
     settings: Settings,
     market_data_adapter: OrangeXAdapter,
@@ -156,6 +173,7 @@ async def _run_single_direction(
             "격자 프리셋 %s 적용: max_stage=%d, leverage=%s배 (.env의 LEVERAGE/MAX_STAGE는 무시됨)",
             settings.grid_preset, settings.max_stage, settings.leverage,
         )
+    _warn_if_mandatory_sl_unreachable(settings)
     logger.info(
         "봇 기동: mode=%s symbol=%s direction=%s leverage=%s 복구된 state=%s filled_step_count=%d",
         settings.trading_mode, settings.symbol, settings.direction, settings.leverage,

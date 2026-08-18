@@ -10,6 +10,7 @@ CycleManager/restart_recovery 각각의 깊은 로직은 이미 각자의 테스
 from __future__ import annotations
 
 import asyncio
+import logging
 from decimal import Decimal
 from pathlib import Path
 
@@ -22,7 +23,7 @@ from engine.halt_flag import HaltedFlagPresentError, write_halt_flag
 from exchange.base import OrderRequest, StopOrderRequest
 from exchange.orangex.adapter import OrangeXAdapter
 from exchange.paper import PaperAdapter
-from main import _derive_halt_flag_path, run
+from main import _derive_halt_flag_path, _warn_if_mandatory_sl_unreachable, run
 
 INSTRUMENT = "BTC-USDT-PERPETUAL"
 
@@ -273,6 +274,36 @@ async def test_run_writes_halt_flag_when_engine_halts_via_fill_router(tmp_path):
     assert flag_path.exists()
     saved = flag_path.read_text(encoding="utf-8")
     assert "SL" in saved or "정지" in saved or "halted" in saved.lower()
+
+
+def test_warns_when_mandatory_sl_tier_is_unreachable(caplog):
+    """1k 프리셋(1 tier)에 기본 .env의 MANDATORY_SL_MIN_TIER=3을 얹으면 major_tier가
+    3에 절대 도달 못 해 필수 SL이 영원히 안 걸린다 — 조용히 넘어가면 안 된다."""
+    settings = make_settings(grid_preset="1k", sl_enabled=True, mandatory_sl_min_tier=3)
+
+    with caplog.at_level(logging.WARNING, logger="main"):
+        _warn_if_mandatory_sl_unreachable(settings)
+
+    assert any("MANDATORY_SL_MIN_TIER" in r.getMessage() for r in caplog.records)
+
+
+def test_no_warning_when_mandatory_sl_tier_is_reachable(caplog):
+    settings = make_settings(grid_preset="1k", sl_enabled=True, mandatory_sl_min_tier=1)
+
+    with caplog.at_level(logging.WARNING, logger="main"):
+        _warn_if_mandatory_sl_unreachable(settings)
+
+    assert caplog.records == []
+
+
+def test_no_warning_when_sl_is_disabled(caplog):
+    """SL을 안 걸기로 했으면 tier가 도달 불가능한 건 애초에 의미가 없다."""
+    settings = make_settings(grid_preset="1k", sl_enabled=False, mandatory_sl_min_tier=3)
+
+    with caplog.at_level(logging.WARNING, logger="main"):
+        _warn_if_mandatory_sl_unreachable(settings)
+
+    assert caplog.records == []
 
 
 def test_derive_halt_flag_path_appends_direction_to_stem():

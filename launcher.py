@@ -301,12 +301,19 @@ def _run_quick_entry() -> None:
             elif step == STEP_RANGE:
                 range_choice = _ask_choice(
                     "\n진입 범위(현재가 기준 ±USDT — 이 범위까지 격자 간격으로 주문을 깝니다)를 선택하세요.",
-                    {"1": "3,000 USDT", "2": "5,000 USDT", "3": "직접 입력"},
-                    default="1",
+                    {
+                        "1": "1,000 USDT (소액 시드용)",
+                        "2": "3,000 USDT",
+                        "3": "5,000 USDT",
+                        "4": "직접 입력",
+                    },
+                    default="2",
                 )
                 if range_choice == "1":
-                    price_range_usdt = Decimal("3000")
+                    price_range_usdt = Decimal("1000")
                 elif range_choice == "2":
+                    price_range_usdt = Decimal("3000")
+                elif range_choice == "3":
                     price_range_usdt = Decimal("5000")
                 else:
                     price_range_usdt = _ask_amount("진입 범위(현재가 기준 ±USDT)를 입력하세요", Decimal("3000"))

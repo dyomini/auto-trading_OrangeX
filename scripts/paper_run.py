@@ -11,7 +11,7 @@
 사용 예:
     python scripts/paper_run.py --direction auto --preset 3k --equity 1500 --seconds 30
     python scripts/paper_run.py --direction both --preset 3k --equity 3000 --seconds 60
-    python scripts/paper_run.py --direction both --preset 1k --equity 300 --target 0.002
+    python scripts/paper_run.py --direction both --preset 1k --equity 300 --target 0.05
 
 주의:
   - `--equity`는 가상 자금이지만 최소 주문 수량 검증은 **실제 계약 스펙**으로 하므로,
@@ -88,7 +88,12 @@ async def _main(args: argparse.Namespace) -> None:
     else:
         overrides["sl_enabled"] = False
 
-    settings = Settings().model_copy(update=overrides)
+    # `Settings().model_copy(update=...)`를 쓰면 안 된다 — model_copy는 검증을 다시
+    # 돌리지 않아서 `_apply_grid_preset`(max_stage/leverage 덮어쓰기)이 실행되지 않는다.
+    # 그러면 `--preset 1k`를 줘도 .env의 MAX_STAGE가 그대로 남아 전혀 다른 격자가
+    # 깔린다(2026-08-18 발견 — `--preset 3k`가 맞아 보였던 건 .env가 이미 3k였을 뿐).
+    # 인자로 안 준 필드는 pydantic-settings가 .env에서 읽어온다.
+    settings = Settings(**overrides)
     print(
         f"설정: mode=paper direction={settings.direction} preset={settings.grid_preset} "
         f"max_stage={settings.max_stage} leverage={settings.leverage} "
@@ -119,7 +124,7 @@ async def _main(args: argparse.Namespace) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(description="봇을 연습(paper) 모드로 잠깐 돌려보는 테스트 도구")
     p.add_argument("--direction", default="auto", choices=["long", "short", "auto", "both"])
-    p.add_argument("--preset", default=None, choices=["3k", "5k"], help="격자 프리셋(레버리지 40배 고정)")
+    p.add_argument("--preset", default=None, choices=["1k", "3k", "5k"], help="격자 프리셋(레버리지 40배 고정)")
     p.add_argument("--leverage", type=float, default=None, help="프리셋 대신 레버리지 직접 지정")
     p.add_argument("--equity", type=float, default=1500, help="가상 운용 자금(USDT)")
     p.add_argument("--seconds", type=int, default=30, help="몇 초 동안 돌릴지")

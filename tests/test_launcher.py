@@ -66,9 +66,9 @@ def test_selecting_live_mode_actually_passes_live_trading_mode(monkeypatch: pyte
     monkeypatch.setattr("engine.grid_setup.build_market_data_adapter", fake_build_market_data_adapter)
     monkeypatch.setattr("quick_entry.run_quick_entry", fake_run_quick_entry)
 
-    # 방향(1=숏) -> 범위(3=직접입력, 250) -> 레버리지(기본값) -> 모드(2=실전) ->
+    # 방향(1=숏) -> 범위(4=직접입력, 250) -> 레버리지(기본값) -> 모드(2=실전) ->
     # 확인1("실행") -> 확인2("실행")
-    lines = "1\n3\n250\n\n2\n실행\n실행\n"
+    lines = "1\n4\n250\n\n2\n실행\n실행\n"
     monkeypatch.setattr("sys.stdin", io.StringIO(lines))
 
     launcher._run_quick_entry()
@@ -104,8 +104,8 @@ def test_selecting_paper_mode_passes_paper_trading_mode(monkeypatch: pytest.Monk
     monkeypatch.setattr("engine.grid_setup.build_market_data_adapter", fake_build_market_data_adapter)
     monkeypatch.setattr("quick_entry.run_quick_entry", fake_run_quick_entry)
 
-    # 방향(1=숏) -> 범위(3=직접입력, 250) -> 레버리지(기본값) -> 모드(1=연습, 기본값)
-    lines = "1\n3\n250\n\n1\n"
+    # 방향(1=숏) -> 범위(4=직접입력, 250) -> 레버리지(기본값) -> 모드(1=연습, 기본값)
+    lines = "1\n4\n250\n\n1\n"
     monkeypatch.setattr("sys.stdin", io.StringIO(lines))
 
     launcher._run_quick_entry()

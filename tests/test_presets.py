@@ -9,6 +9,21 @@ from config.presets import GRID_PRESETS, GridPresetError, resolve_preset
 from config.settings import Settings
 
 
+def test_1k_preset_resolves_to_one_tier_at_40x():
+    """2026-08-18 추가 — 소액 시드(296 USDT)용. 1000/50 = 20단계 = 정확히 1 tier."""
+    max_stage, leverage = resolve_preset("1k", Decimal("50"))
+    assert (max_stage, leverage) == (1, Decimal("40"))
+
+
+def test_settings_with_1k_preset_overrides_max_stage_and_leverage():
+    settings = Settings(
+        grid_preset="1k", grid_tick=Decimal("50"), leverage=Decimal("2"), max_stage=5
+    )
+
+    assert settings.max_stage == 1
+    assert settings.leverage == Decimal("40")
+
+
 def test_3k_preset_resolves_to_three_tiers_at_40x():
     max_stage, leverage = resolve_preset("3k", Decimal("50"))
     assert (max_stage, leverage) == (3, Decimal("40"))
@@ -86,3 +101,17 @@ def test_empty_grid_preset_env_value_is_treated_as_unset():
     assert settings.grid_preset is None
     assert settings.leverage == Decimal("20")
     assert settings.max_stage == 4
+
+
+def test_model_copy_does_not_reapply_preset():
+    """`model_copy(update=...)`는 검증을 다시 돌리지 않으므로 프리셋이 적용되지 않는다.
+    설정을 나중에 바꿔 끼우는 코드(scripts/paper_run.py 등)는 반드시 `Settings(...)`로
+    새로 만들어야 한다 — 2026-08-18에 paper_run.py가 이 함정에 빠져 `--preset 1k`를 줘도
+    .env의 MAX_STAGE(3)가 그대로 쓰이고 있었다."""
+    base = Settings(grid_preset=None, leverage=Decimal("20"), max_stage=3, grid_tick=Decimal("50"))
+
+    copied = base.model_copy(update={"grid_preset": "1k"})
+    rebuilt = Settings(grid_preset="1k", leverage=Decimal("20"), max_stage=3, grid_tick=Decimal("50"))
+
+    assert copied.max_stage == 3 and copied.leverage == Decimal("20")  # 적용 안 됨(함정)
+    assert rebuilt.max_stage == 1 and rebuilt.leverage == Decimal("40")  # 이렇게 만들어야 한다

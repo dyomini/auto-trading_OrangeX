@@ -1,11 +1,18 @@
-"""격자 프리셋 — 사용자가 "3k"/"5k" 중 하나를 고르면 단계 수와 레버리지가 함께 정해진다
-(2026-08-17 사용자 결정: "5k와 3k는 내가 설정에서 미리 설정할 수 있도록 해.
-레버리지는 40배 고정").
+"""격자 프리셋 — 사용자가 "1k"/"3k"/"5k" 중 하나를 고르면 단계 수와 레버리지가 함께
+정해진다 (2026-08-17 사용자 결정: "5k와 3k는 내가 설정에서 미리 설정할 수 있도록 해.
+레버리지는 40배 고정". 2026-08-18에 소액 시드용 "1k" 추가).
 
 프리셋은 **현재가 기준 ± 가격 범위(USDT)** 를 뜻한다 — quick_entry의 3k/5k 선택지와
 같은 의미다. 범위를 `grid_tick`으로 나눠 단계 수를 얻고, 그걸 20단계(1 tier)로 나눠
-`max_stage`를 정한다. 기본값(`grid_tick=50`)에서 3k -> 60단계(3 tier), 5k -> 100단계(5 tier)로
-정확히 떨어진다.
+`max_stage`를 정한다. 기본값(`grid_tick=50`)에서 1k -> 20단계(1 tier), 3k -> 60단계(3 tier),
+5k -> 100단계(5 tier)로 정확히 떨어진다.
+
+**1k 추가 근거(2026-08-18, 실측)**: 사용자 보유 시드가 296 USDT라 3k(최소 약 548)/5k(약 2,656)
+어느 쪽도 시작할 수 없었다. 라이브 BTC 64,241 기준으로 1k는 **최소 시드 약 65 USDT**
+(both는 130)라 296으로 여유 있게 들어간다. 실사용 단계는 가용잔고 절삭 후 17/20단계,
+최심 주문가~청산가 완충은 **2.15%p**로 3k(2.08%p)/5k(2.01%p)와 같은 수준이라 레버리지
+40배를 그대로 유지했다. 다만 tier가 1개뿐이라 `mandatory_sl_min_tier`(기본 3~4)에는
+영원히 도달하지 못한다 — SL을 쓸 거면 이 값을 1로 낮춰야 한다(`main.py`가 경고를 찍는다).
 
 **레버리지 40배를 고른 근거**(라이브 BTC 63,663 기준으로 계산해 사용자와 확인함):
 가용잔고 절삭 후 실제로 걸리는 격자의 최심 주문가와, 그 상태의 청산가 사이 완충이
@@ -23,7 +30,7 @@ from typing import Literal
 
 from strategy.grid import STEPS_PER_TIER, TOTAL_STEPS
 
-GridPresetName = Literal["3k", "5k"]
+GridPresetName = Literal["1k", "3k", "5k"]
 
 
 class GridPresetError(ValueError):
@@ -38,6 +45,7 @@ class GridPreset:
 
 
 GRID_PRESETS: dict[str, GridPreset] = {
+    "1k": GridPreset(price_range_usdt=Decimal("1000"), leverage=Decimal("40")),
     "3k": GridPreset(price_range_usdt=Decimal("3000"), leverage=Decimal("40")),
     "5k": GridPreset(price_range_usdt=Decimal("5000"), leverage=Decimal("40")),
 }

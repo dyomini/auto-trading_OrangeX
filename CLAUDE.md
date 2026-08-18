@@ -101,8 +101,10 @@ Phase 0~3 완료. paper 모드는 바로 쓸 수 있고, `quick_entry`는 실전
 기동해본 적은 아직 없다.**
 
 **2026-08-17 대규모 개편** (자세한 내역은 `docs/phase3-plan.md`):
-- `GRID_PRESET=3k|5k` — 현재가 기준 ±가격 범위 프리셋. **레버리지 40배 고정**이고
-  `MAX_STAGE`/`LEVERAGE`를 덮어쓴다. 최소 시드 3k≈548 / 5k≈2,656 USDT(both는 2배).
+- `GRID_PRESET=1k|3k|5k` — 현재가 기준 ±가격 범위 프리셋. **레버리지 40배 고정**이고
+  `MAX_STAGE`/`LEVERAGE`를 덮어쓴다. 최소 시드 1k≈65 / 3k≈548 / 5k≈2,656 USDT(both는 2배).
+  **1k는 2026-08-18 추가**(소액 시드용, 20단계=1 tier). tier가 1개뿐이라
+  `MANDATORY_SL_MIN_TIER`가 2 이상이면 필수 SL이 영원히 안 걸린다 — `main.py`가 경고한다.
 - `DIRECTION=auto` — 사이클마다 **15분봉** RSI(14)로 방향 결정(≥50 숏, <50 롱).
   방향이 바뀌면 어댑터 스택을 통째로 재조립한다(position_side가 생성 시 고정이라).
 - `DIRECTION=both` **재정의** — 양방향 동시 진입 + 롱/숏 **합산** 손익이 투입 증거금 대비
@@ -126,7 +128,7 @@ API 키 권한 확인, 가격 급변 방어도 전부 없다. SPEC에 "협상 �
 지역값일 뿐이다), (2) `get_open_orders()`의 `position_side` 필터링 라이브 검증
 (다른 엔드포인트 스키마로부터 유추한 것).
 
-테스트는 **257개 전부 통과**한다. 오랫동안 "Python 3.14 asyncio 문제"로 기록돼 있던
+테스트는 **271개 전부 통과**한다. 오랫동안 "Python 3.14 asyncio 문제"로 기록돼 있던
 실패 1건은 실제로는 테스트 격리 문제였다 — `Settings`가 kwargs로 안 넘긴 필드를 CWD의
 `.env`에서 읽어와 로컬 `MANUAL_MODE=TRUE`가 흘러들어간 것. `tests/conftest.py`가
 `.env` 로딩을 꺼서 차단한다. **테스트에서 `Settings`를 만들 땐 결과에 영향 주는 필드를
