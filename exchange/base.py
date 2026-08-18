@@ -45,6 +45,19 @@ class Balance:
 
 
 @dataclass(frozen=True)
+class PortfolioPnl:
+    """계좌 전체의 미실현손익과 투입 증거금 — 거래소가 직접 알려주는 값.
+
+    로컬 계산(현재가 × 수량 - 평단 × 수량)과 달리 펀딩비·실제 체결가·실제 수수료가
+    이미 반영돼 있다. **계좌 전체 합계**라 instrument별/봇별 구분이 없다는 점에 주의
+    (2026-08-18 사용자 확인: 이 계좌는 이 봇 전용으로 쓰므로 문제되지 않음).
+    """
+
+    unrealized_pnl: Decimal
+    initial_margin: Decimal
+
+
+@dataclass(frozen=True)
 class Position:
     instrument: str
     direction: Optional[Direction]  # None이면 무포지션(flat)
@@ -151,6 +164,13 @@ class ExchangeAdapter(ABC):
 
     @abstractmethod
     async def get_ticker(self, instrument: str) -> Ticker: ...
+
+    async def get_portfolio_pnl(self) -> Optional[PortfolioPnl]:
+        """계좌 전체의 미실현손익/투입 증거금을 거래소에서 직접 읽어온다.
+
+        지원하지 않는 구현(예: `PaperAdapter`)은 `None`을 반환하고, 호출부는 그때
+        로컬 계산으로 폴백한다 — abstract가 아닌 이유다."""
+        return None
 
     async def aclose(self) -> None:
         """이 어댑터가 **직접 만들어 소유한** 자원을 정리한다. 기본은 no-op이라

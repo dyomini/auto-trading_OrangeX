@@ -62,6 +62,7 @@ from exchange.base import (
     OrderRequest,
     OrderResult,
     OrderStatus,
+    PortfolioPnl,
     Position,
     StopOrderRequest,
     Ticker,
@@ -166,6 +167,43 @@ class OrangeXAdapter(ExchangeAdapter):
                 f"필드명인데 응답 envelope이 다름) — 라이브 재검증 필요: {e!r}"
             ) from e
         return Balance(equity=equity, available=available)
+
+    async def get_portfolio_pnl(self) -> PortfolioPnl:
+        """계좌 전체의 미실현손익/투입 증거금을 `get_assets_info`에서 직접 읽는다.
+
+        2026-08-18 라이브 조회로 필드 존재 확인: `total_upl`(미실현손익 합계),
+        `total_initial_margin_cross` / `total_initial_margin_isolated`(투입 증거금).
+        확인 시점에는 계좌가 flat이라 전부 0이었지만, 실제 포지션이 있을 때 이 값들이
+        0이 아니라는 건 이미 관찰된 바 있다 — docs/api-notes.md 항목13에서
+        `get_positions`가 빈 배열을 반환하는 와중에 `total_upl_cross`/
+        `total_initial_margin_cross`가 0이 아닌 걸 근거로 "서버에는 포지션이 있다"고
+        판정했었다.
+
+        **계좌 전체 합계**라 instrument/방향 구분이 없다. 이 계좌를 이 봇 전용으로
+        쓴다는 전제에서만 유효하다(2026-08-18 사용자 확인) — quick_entry나 수동 매매로
+        연 포지션이 있으면 그 손익까지 섞여 들어온다.
+
+        증거금은 cross/isolated를 **합산**한다. 응답에 통합 필드가 없고, 계좌의
+        margin_type이 무엇이든 맞게 동작해야 하기 때문이다.
+        """
+        result = await self._client.call(
+            "/private/get_assets_info", {"asset_type": [_ACCOUNT_ASSET_TYPE]}
+        )
+        data = result
+        if isinstance(result, dict) and _ACCOUNT_ASSET_TYPE in result:
+            data = result[_ACCOUNT_ASSET_TYPE]
+
+        try:
+            upl = Decimal(str(data["total_upl"]))
+            margin = Decimal(str(data["total_initial_margin_cross"])) + Decimal(
+                str(data["total_initial_margin_isolated"])
+            )
+        except (KeyError, TypeError) as e:
+            raise OrangeXResponseSchemaError(
+                "get_assets_info 응답에 total_upl / total_initial_margin_cross / "
+                f"total_initial_margin_isolated 필드가 없음 — 라이브 재검증 필요: {e!r}"
+            ) from e
+        return PortfolioPnl(unrealized_pnl=upl, initial_margin=margin)
 
     async def get_position(self, instrument: str) -> Position:
         # 2026-07-30: 문서(§3)에 명시된 `/private/get_positions`는 실제 포지션이 있는

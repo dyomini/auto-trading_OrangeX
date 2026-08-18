@@ -880,3 +880,53 @@ async def test_aclose_closes_ws_client_but_not_shared_rest_client():
 async def test_aclose_without_ws_client_is_noop():
     adapter = OrangeXAdapter(FakeClient({}))
     await adapter.aclose()  # 예외 없이 통과해야 함
+
+
+@pytest.mark.asyncio
+async def test_get_portfolio_pnl_reads_upl_and_initial_margin():
+    """2026-08-18 라이브 조회로 확인한 필드를 그대로 읽는지. 증거금은 cross+isolated 합산."""
+    client = FakeClient({
+        "/private/get_assets_info": {
+            "PERPETUAL": {
+                "total_upl": "12.5",
+                "total_initial_margin_cross": "80",
+                "total_initial_margin_isolated": "20",
+                "available_funds": "296.3",
+                "total_margin_balance": "296.3",
+            }
+        }
+    })
+    adapter = OrangeXAdapter(client)
+
+    pnl = await adapter.get_portfolio_pnl()
+
+    assert pnl.unrealized_pnl == Decimal("12.5")
+    assert pnl.initial_margin == Decimal("100")
+
+
+@pytest.mark.asyncio
+async def test_get_portfolio_pnl_raises_when_fields_missing():
+    """추측해서 0을 반환하면 합산 익절이 영원히 발동 안 하거나 잘못 발동한다 — 명시적 실패."""
+    client = FakeClient({"/private/get_assets_info": {"PERPETUAL": {"available_funds": "1"}}})
+    adapter = OrangeXAdapter(client)
+
+    with pytest.raises(OrangeXResponseSchemaError, match="total_upl"):
+        await adapter.get_portfolio_pnl()
+
+
+@pytest.mark.asyncio
+async def test_paper_adapter_reports_no_portfolio_pnl():
+    """PaperAdapter는 계좌 개념이 없으므로 None — 호출부가 로컬 계산으로 폴백한다."""
+    from exchange.base import ContractSpec
+    from exchange.paper import PaperAdapter
+
+    spec = ContractSpec(
+        instrument="BTC-USDT-PERPETUAL", tick_size=Decimal("50"), min_qty=Decimal("0.001"),
+        min_notional=Decimal("10"), contract_size=Decimal("1"),
+    )
+    adapter = PaperAdapter(
+        instrument="BTC-USDT-PERPETUAL", contract_spec=spec, initial_equity=Decimal("1000"),
+        leverage=Decimal("20"), maker_fee=Decimal("0.0002"), taker_fee=Decimal("0.0006"),
+    )
+
+    assert await adapter.get_portfolio_pnl() is None

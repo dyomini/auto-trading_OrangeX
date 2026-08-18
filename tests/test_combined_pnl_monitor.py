@@ -14,7 +14,7 @@ from config.settings import Settings
 from engine.combined_pnl_monitor import CombinedPnlMonitor
 from engine.cycle_manager import CycleOutcome
 from engine.grid_engine import EngineState, GridEngine
-from exchange.base import ContractSpec, Ticker
+from exchange.base import ContractSpec, PortfolioPnl, Ticker
 from exchange.paper import PaperAdapter
 from strategy.grid import GridStepResult
 
@@ -188,3 +188,128 @@ async def test_run_closes_both_and_requests_rebuild_at_target():
     assert short_engine.open_qty == Decimal("0")
     assert monitor.last_snapshot is not None
     assert monitor.last_snapshot.roe >= Decimal("0.10")
+
+
+# --------------------------------------------------------------------------
+# 거래소 PnL 직접 사용 (2026-08-18) — get_assets_info의 total_upl /
+# total_initial_margin_*를 그대로 읽어 판정한다. paper는 로컬 계산으로 폴백.
+# --------------------------------------------------------------------------
+
+
+class _PnlAdapter(PaperAdapter):
+    """get_portfolio_pnl()을 지원하는 어댑터(라이브 흉내)."""
+
+    portfolio: object = None
+
+    async def get_portfolio_pnl(self):
+        return self.portfolio
+
+
+def make_engine_with_pnl(direction: str, qty: Decimal, avg: Decimal, portfolio) -> GridEngine:
+    spec = ContractSpec(
+        instrument=INSTRUMENT, tick_size=Decimal("50"), min_qty=Decimal("0.0001"),
+        min_notional=Decimal("10"), contract_size=Decimal("1"),
+    )
+    adapter = _PnlAdapter(
+        instrument=INSTRUMENT, contract_spec=spec, initial_equity=Decimal("10000"),
+        leverage=Decimal("20"), maker_fee=Decimal("0.0002"), taker_fee=Decimal("0.0006"),
+    )
+    adapter.portfolio = portfolio
+    engine = GridEngine(
+        adapter=adapter, instrument=INSTRUMENT, direction=direction,
+        grid_rows=[make_row(avg, avg)], max_open_grid_orders=1, manual_mode=True,
+    )
+    engine.state = EngineState.LADDERING
+    engine.filled_step_count = 1
+    engine.open_qty = qty
+    return engine
+
+
+@pytest.mark.asyncio
+async def test_snapshot_prefers_exchange_reported_pnl():
+    """거래소 값이 있으면 로컬 추정 대신 그걸 쓴다 — 수수료/펀딩비가 이미 반영된 값."""
+    portfolio = PortfolioPnl(unrealized_pnl=Decimal("50"), initial_margin=Decimal("400"))
+    engines = {
+        "long": make_engine_with_pnl("long", Decimal("0.1"), Decimal("64000"), portfolio),
+        "short": make_engine_with_pnl("short", Decimal("0.1"), Decimal("64000"), portfolio),
+    }
+    monitor = make_monitor(engines, Decimal("65000"))
+
+    snap = await monitor.snapshot(Decimal("65000"))
+
+    assert snap.source == "exchange"
+    assert snap.pnl == Decimal("50")
+    assert snap.margin == Decimal("400")
+    assert snap.roe == Decimal("0.125")
+    # 거래소 값에는 수수료가 이미 반영돼 있어 따로 빼지 않는다
+    assert snap.fees == Decimal("0")
+    assert snap.net_pnl == Decimal("50")
+
+
+@pytest.mark.asyncio
+async def test_snapshot_falls_back_to_local_when_adapter_has_no_pnl():
+    """PaperAdapter는 get_portfolio_pnl()이 None — 연습 모드는 로컬 계산으로 동작해야 한다."""
+    engines = {
+        "long": make_engine("long", Decimal("0.1"), Decimal("64000")),
+        "short": make_engine("short", Decimal("0.1"), Decimal("64000")),
+    }
+    monitor = make_monitor(engines, Decimal("65000"))
+
+    snap = await monitor.snapshot(Decimal("65000"))
+
+    assert snap.source == "local"
+    assert snap.margin == Decimal("640")
+
+
+@pytest.mark.asyncio
+async def test_snapshot_ignores_exchange_when_it_reports_zero_margin_but_engines_hold():
+    """주문 직후 인덱싱 지연 등으로 거래소가 증거금 0을 보고할 수 있다 —
+    그 값으로 청산 판단을 내리면 안 되므로 로컬 계산으로 대체한다."""
+    portfolio = PortfolioPnl(unrealized_pnl=Decimal("0"), initial_margin=Decimal("0"))
+    engines = {
+        "long": make_engine_with_pnl("long", Decimal("0.1"), Decimal("64000"), portfolio),
+        "short": make_engine_with_pnl("short", Decimal("0.1"), Decimal("64000"), portfolio),
+    }
+    monitor = make_monitor(engines, Decimal("65000"))
+
+    snap = await monitor.snapshot(Decimal("65000"))
+
+    assert snap.source == "local"
+    assert snap.margin == Decimal("640")
+
+
+@pytest.mark.asyncio
+async def test_run_triggers_on_exchange_reported_roe():
+    portfolio = PortfolioPnl(unrealized_pnl=Decimal("60"), initial_margin=Decimal("400"))  # 15%
+    long_engine = make_engine_with_pnl("long", Decimal("0.1"), Decimal("64000"), portfolio)
+    short_engine = make_engine_with_pnl("short", Decimal("0.1"), Decimal("64000"), portfolio)
+    engines = {"long": long_engine, "short": short_engine}
+    monitor = make_monitor(engines, Decimal("64000"))
+    for e in engines.values():
+        await e.adapter.on_price_tick(Decimal("64000"))
+
+    outcome = await asyncio.wait_for(monitor.run(), timeout=5)
+
+    assert outcome is CycleOutcome.REBUILD_REQUESTED
+    assert monitor.last_snapshot.source == "exchange"
+    assert long_engine.state == EngineState.COOLDOWN
+    assert short_engine.state == EngineState.COOLDOWN
+
+
+@pytest.mark.asyncio
+async def test_run_does_not_trigger_when_exchange_roe_below_target():
+    """로컬 계산이었다면 발동했을 상황에서도 거래소 값이 목표 미달이면 발동하면 안 된다."""
+    portfolio = PortfolioPnl(unrealized_pnl=Decimal("4"), initial_margin=Decimal("400"))  # 1%
+    engines = {
+        "long": make_engine_with_pnl("long", Decimal("0.1"), Decimal("64000"), portfolio),
+        "short": make_engine_with_pnl("short", Decimal("0"), Decimal("64000"), portfolio),
+    }
+    monitor = make_monitor(engines, Decimal("70000"))  # 로컬로는 롱 단독 대박
+
+    task = asyncio.create_task(monitor.run())
+    for _ in range(200):
+        await asyncio.sleep(0)
+    assert not task.done(), "거래소 기준 1%인데 발동했다"
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task

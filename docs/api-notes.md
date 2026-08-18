@@ -264,3 +264,5 @@ Phase 2까지 "SL/TP 메커니즘 불확실"로 남겨두고 스코프에서 제
 ## 8. 요약: 다음 Phase 전 확인이 필요한 것
 
 Phase 1(계산 엔진)은 거래소와 무관하므로 이 API 조사 결과와 독립적으로 진행 가능하다. 단, **Phase 2(거래소 어댑터) 시작 전에는 §6의 미확인 항목, 특히 SL/TP 메커니즘·레이트 리밋·테스트넷 유무·계약 스펙 실측값을 확정해야 한다.**
+
+20. **[확인, 2026-08-18] 계좌 전체 미실현손익/투입 증거금을 `get_assets_info`에서 직접 읽을 수 있다** — `/private/get_assets_info(asset_type=["PERPETUAL"])` 응답(42개 필드)에 `total_upl` / `total_upl_cross` / `total_upl_isolated`(미실현손익)와 `total_initial_margin_cross` / `total_initial_margin_isolated`(투입 증거금), `position_rpl`(누적 실현손익)이 있다. 확인 시점에 계좌가 flat이라 손익 관련 값은 전부 0이었지만, **포지션이 있을 때 이 값들이 0이 아니라는 건 항목13에서 이미 관찰됐다**(`get_positions`가 빈 배열인데 `total_upl_cross`/`total_initial_margin_cross`가 0이 아닌 걸 근거로 서버에 포지션이 있다고 판정했던 그 사례). `ExchangeAdapter.get_portfolio_pnl()`로 노출하고 `engine/combined_pnl_monitor.py`(DIRECTION=both 합산 익절)가 로컬 추정 대신 이 값으로 판정한다 — 펀딩비·실제 체결가·실제 수수료가 이미 반영돼 있어서 더 정확하다. **한계**: 계좌 전체 합계라 instrument/방향 구분이 없다(같은 계좌로 다른 포지션을 잡으면 섞인다). `details` 필드도 확인해봤지만 코인별 잔고 브레이크다운일 뿐 포지션별 손익이 아니다. 포지션별 `floating_profit_loss`(항목13에 기록됨)는 원본 payload가 저장돼 있지 않고 확인 시점에 계좌가 flat이라 재검증 못 함. **아직 실제 포지션과 함께 관측한 적은 없으므로**, 라이브 첫 실행 시 모니터가 찍는 "손익 대조" 로그에서 거래소 값과 로컬 추정값을 반드시 대조할 것.
