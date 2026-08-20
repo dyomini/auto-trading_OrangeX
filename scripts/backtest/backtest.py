@@ -371,6 +371,15 @@ def run_auto(sim: Simulator, start_balance: Decimal, sl_enabled: bool) -> Result
             if sim.try_fill_entries(acct, side, price):
                 sim.register_tp_sl(side, sl_enabled, price)
                 max_steps = max(max_steps, side.filled)
+                # 같은 틱에서 격자가 채워지면 포지션이 커진 상태로 다시 판정해야 한다 —
+                # 체결 전 크기로만 검사하면 급등 1분봉에서 청산을 놓친다.
+                if acct.is_liquidatable(price):
+                    acct.liquidate(price)
+                    liq_ms, liq_px = ms, price
+                    trades.append((cycle_start_ms, side.direction, side.entries[0], "LIQUIDATED",
+                                   acct.balance - cycle_start_balance, side.filled, acct.balance))
+                    side = None
+                    break
             if side.filled == 0:
                 continue
 
@@ -493,9 +502,20 @@ def run_both(sim: Simulator, start_balance: Decimal) -> Result:
             if sides is None:
                 continue
 
+            filled_now = False
             for s in sides.values():
-                sim.try_fill_entries(acct, s, price)
+                if sim.try_fill_entries(acct, s, price):
+                    filled_now = True
                 max_steps = max(max_steps, s.filled)
+            # run_auto와 같은 이유 — 체결 직후 커진 포지션으로 다시 판정한다.
+            if filled_now and acct.is_liquidatable(price):
+                acct.liquidate(price)
+                liq_ms, liq_px = ms, price
+                trades.append((cycle_start_ms, "both", sides["long"].entries[0], "LIQUIDATED",
+                               acct.balance - cycle_start_balance,
+                               max(x.filled for x in sides.values()), acct.balance))
+                sides = None
+                break
 
             pnl = margin = fees = Decimal("0")
             for d, s in sides.items():
