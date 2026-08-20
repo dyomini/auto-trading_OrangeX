@@ -20,3 +20,11 @@ logs/
 
 # 배포용으로 로컬에서 묶은 압축본 — 소스가 이미 저장소에 있어 커밋 대상 아님
 *.zip
+
+# 백테스트 원본 데이터(수십 MB)와 실행 산출물 — fetch_data.py로 언제든 다시 만든다
+scripts/backtest/data*/
+scripts/backtest/results*.csv
+scripts/backtest/rolling*.csv
+scripts/backtest/curves*.csv
+scripts/backtest/trades*.csv
+scripts/backtest/*.txt
